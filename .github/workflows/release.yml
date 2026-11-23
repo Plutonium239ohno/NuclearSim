@@ -1,0 +1,108 @@
+name: Release
+
+# Push a tag like v0.1.0 to build NuclearSim for Linux, Windows and macOS
+# and attach the downloads to a GitHub Release. "Run workflow" on the
+# Actions tab builds them too (as workflow artifacts, no release).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The repo's .cargo/config.toml builds for this machine's CPU only
+  # (target-cpu=native); downloads must run on any CPU.
+  RUSTFLAGS: ""
+  # SimCore is fetched with git (so a token, if set, is used).
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      # SimCore is private: read it with a token saved as the SIMCORE_TOKEN
+      # secret (not needed once SimCore is public).
+      - name: Access to SimCore
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.SIMCORE_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+      - name: System libraries for macroquad
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=NuclearSim-${{ matrix.name }}
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/nuclear-sim.exe "dist/$name/NuclearSim.exe"
+          else
+            cp target/${{ matrix.target }}/release/nuclear-sim "dist/$name/NuclearSim"
+            chmod +x "dist/$name/NuclearSim"
+          fi
+          cp README.md "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NuclearSim-${{ matrix.name }}
+          path: dist/NuclearSim-${{ matrix.name }}.*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Download the file for your system, unpack it and run NuclearSim (NuclearSim.exe on Windows).
+
+            - **Windows**: if SmartScreen warns about an unknown app, click "More info" → "Run anyway".
+            - **macOS**: the app isn't signed. The first time, right-click NuclearSim → Open → Open (or run `xattr -d com.apple.quarantine NuclearSim` in the folder).
+            - **Linux**: `./NuclearSim`.
+
+            Saved scenes go to `~/.local/share/nuclear-game/scenes` (Windows: `%APPDATA%\nuclear-game\scenes`).

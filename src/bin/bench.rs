@@ -10,7 +10,7 @@ fn run(label: &str, n: usize, frames: usize, setup: impl Fn(&mut Sim)) {
     sim.rules.randomize();
     sim.cfg.coulomb = false;
     sim.cfg.uniform_gravity = true;
-    for t in sim.types.iter_mut() { t.in_random_spawn = !t.ghost && !t.fluid && t.charge == 0.0; }
+    for t in sim.types.iter_mut() { t.in_random_spawn = !t.ghost && t.charge == 0.0; }
     setup(&mut sim);
     let placed = sim.spawn_random(n);
     for _ in 0..30 { sim.step(1.0 / 60.0, None); } // warm-up

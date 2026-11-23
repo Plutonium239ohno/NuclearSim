@@ -1,5 +1,5 @@
 //! Particle Sim: a sandbox of particle species, an interaction matrix
-//! ("particle life"), gravity, charges, liquids and walls.
+//! ("particle life"), gravity, charges and walls.
 //!
 //! Run: cargo run --release
 
@@ -8,7 +8,6 @@ mod ui;
 use macroquad::prelude::*;
 use particle_sim::gui::Gui;
 use particle_sim::render::{Renderer, ViewMode};
-use particle_sim::scenes;
 use particle_sim::sim::{MouseForce, Sim};
 use particle_sim::zoom::{Zoom, ZoomState};
 use std::time::Instant;
@@ -48,23 +47,14 @@ fn sandbox_sim() -> Sim {
     sim
 }
 
-/// Random interaction matrix over the (non-liquid) species and a fresh
-/// random fill.
+/// Random interaction matrix and a fresh random fill.
 fn new_world(sim: &mut Sim, count: usize) {
     sim.clear();
     let types = sim.types.clone();
-    sim.rules.randomize_where(|k| types[k].custom && !types[k].fluid);
+    sim.rules.randomize_where(|k| types[k].custom);
     sim.cfg.rules = true;
     sim.cfg.uniform_gravity = false;
-    // Liquids sit out the random world (they need gravity and a basin).
-    let saved: Vec<bool> = sim.types.iter().map(|t| t.in_random_spawn).collect();
-    for t in sim.types.iter_mut().filter(|t| t.fluid) {
-        t.in_random_spawn = false;
-    }
     sim.spawn_random(count);
-    for (t, s) in sim.types.iter_mut().zip(saved) {
-        t.in_random_spawn = s;
-    }
 }
 
 fn erase_particles(sim: &mut Sim, at: Vec2, r: f32) {
@@ -79,9 +69,6 @@ async fn main() {
     let mut ui = Gui::new();
     let mut sim = sandbox_sim();
     let mut app = App::new(&sim);
-    for t in sim.types.iter_mut().filter(|t| t.fluid) {
-        t.in_random_spawn = false;
-    }
     new_world(&mut sim, 3000);
     let mut zoom = Zoom::default();
     // Wall tool: last committed point of the stroke, and where a Shift-drag
@@ -90,15 +77,10 @@ async fn main() {
     let mut wall_start: Option<Vec2> = None;
 
     // Dev automation: PARTICLE_SIM_SHOT=<png> saves frame PARTICLE_SIM_FRAMES
-    // (240) and exits; PARTICLE_SIM_SCENE=dam|oil, PARTICLE_SIM_VIEW=speed|
+    // (240) and exits; PARTICLE_SIM_VIEW=speed|
     // trails, PARTICLE_SIM_TAB=species|matrix|physics|view, PARTICLE_SIM_ZOOM=1.
     let auto_shot = std::env::var("PARTICLE_SIM_SHOT").ok();
     let shot_frame: u64 = std::env::var("PARTICLE_SIM_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(240);
-    match std::env::var("PARTICLE_SIM_SCENE").as_deref() {
-        Ok("dam") => scenes::dam_break(&mut sim),
-        Ok("oil") => scenes::oil_and_water(&mut sim),
-        _ => {}
-    }
     match std::env::var("PARTICLE_SIM_VIEW").as_deref() {
         Ok("speed") => app.view.mode = ViewMode::Speed,
         Ok("trails") => app.view.trails = true,
@@ -258,9 +240,6 @@ async fn main() {
                 let t = &sim.types[sim.kind[i] as usize];
                 let mut l = vec![t.name.clone(), format!("speed {:.0} px/s", sim.vel[i].length())];
                 l.push(format!("radius {:.1}   mass {:.2}{}", t.radius, t.mass, if t.charge != 0.0 { format!("   charge {:+.1}", t.charge) } else { String::new() }));
-                if t.fluid {
-                    l.push("liquid".into());
-                }
                 ui.draw_tooltip(&l);
             }
         }
@@ -288,7 +267,7 @@ async fn main() {
             if is_key_pressed(KeyCode::K) { c.collisions = !c.collisions; }
             if is_key_pressed(KeyCode::R) {
                 let types = sim.types.clone();
-                sim.rules.randomize_where(|k| types[k].custom && !types[k].fluid);
+                sim.rules.randomize_where(|k| types[k].custom);
                 sim.cfg.rules = true;
                 app.say("Randomized the interaction matrix");
             }
@@ -327,8 +306,6 @@ async fn main() {
             }
         }
         if act.new_world { new_world(&mut sim, app.spawn_count as usize); }
-        if act.dam_break { scenes::dam_break(&mut sim); }
-        if act.oil_water { scenes::oil_and_water(&mut sim); }
 
         if let Some(p) = &auto_shot {
             if frame == shot_frame {

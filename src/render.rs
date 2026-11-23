@@ -1,7 +1,7 @@
-//! Drawing: particles (one textured quad each), smooth liquid surfaces,
+//! Drawing: particles (one textured quad each),
 //! view modes (normal / speed heatmap / element), trails and walls.
 
-use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
+use macroquad::miniquad::{BlendState, PipelineParams};
 use macroquad::prelude::*;
 use crate::nucdata::nuclide_name;
 use crate::sim::Sim;
@@ -33,8 +33,6 @@ impl ViewMode {
 
 pub struct View {
     pub mode: ViewMode,
-    /// Draw liquids as one continuous surface instead of dots.
-    pub smooth_fluid: bool,
     /// Motion trails (particles leave fading streaks).
     pub trails: bool,
     /// Fraction of the trail image cleared per frame (smaller = longer trails).
@@ -47,7 +45,7 @@ pub struct View {
 
 impl Default for View {
     fn default() -> Self {
-        Self { mode: ViewMode::Normal, smooth_fluid: true, trails: false, trail_fade: 0.12, speed_scale: 500.0, labels: true }
+        Self { mode: ViewMode::Normal, trails: false, trail_fade: 0.12, speed_scale: 500.0, labels: true }
     }
 }
 
@@ -63,40 +61,6 @@ void main() {
     gl_Position = Projection * Model * vec4(position, 1.0);
     color = color0 / 255.0;
     uv = texcoord;
-}
-"#;
-
-/// Splat: accumulate premultiplied colour and coverage (additively).
-const BLOB_FRAG: &str = r#"#version 100
-precision mediump float;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform sampler2D Texture;
-void main() {
-    float f = texture2D(Texture, uv).a * 0.25;
-    gl_FragColor = vec4(color.rgb * f, f);
-}
-"#;
-
-/// Composite: threshold the accumulated coverage into a surface, recover the
-/// average colour, brighten a rim along the free surface.
-const COMPOSITE_FRAG: &str = r#"#version 100
-precision mediump float;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform sampler2D Texture;
-uniform float thr;
-void main() {
-    vec4 t = texture2D(Texture, uv);
-    float a = t.a;
-    float lo = thr * 0.75;
-    if (a < lo) discard;
-    vec3 c = t.rgb / max(a, 1e-4);
-    float edge = smoothstep(lo, thr, a);
-    float rim = 1.0 - smoothstep(thr, thr * 2.0, a);
-    float depth = smoothstep(thr * 2.0, thr * 4.0, a);
-    c = mix(c * (1.0 - 0.1 * depth), min(c * 1.4 + 0.1, vec3(1.0)), rim);
-    gl_FragColor = vec4(c, 0.93 * edge);
 }
 "#;
 
@@ -148,11 +112,7 @@ impl Target {
 
 pub struct Renderer {
     disc: Texture2D,
-    blob: Texture2D,
-    blob_mat: Material,
-    comp_mat: Material,
     opaque_mat: Material,
-    fluid: Option<Target>,
     trail: Option<Target>,
     colors: Vec<Color>,
     nuclei: HashMap<u32, (u32, u32, Vec2)>,
@@ -176,17 +136,6 @@ fn radial_texture(s: u16, f: impl Fn(f32) -> f32) -> Texture2D {
     let tex = Texture2D::from_image(&img);
     tex.set_filter(FilterMode::Linear);
     tex
-}
-
-/// Blob falloff (1 - r^2)^2, r in [0, 1] over the quad.
-fn blob_texture() -> Texture2D {
-    let s = 64u16;
-    let c = s as f32 / 2.0;
-    radial_texture(s, |edge| {
-        let r = 1.0 - edge / c;
-        let x = (1.0 - r * r).max(0.0);
-        x * x
-    })
 }
 
 fn material(frag: &str, blend: Option<BlendState>, uniforms: Vec<UniformDesc>) -> Material {
@@ -245,19 +194,9 @@ fn element_color(z: u32, n: u32) -> Color {
 
 impl Renderer {
     pub fn new() -> Self {
-        let additive = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::One);
-        let alpha = BlendState::new(
-            Equation::Add,
-            BlendFactor::Value(BlendValue::SourceAlpha),
-            BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
-        );
         Self {
             disc: disc_texture(),
-            blob: blob_texture(),
-            blob_mat: material(BLOB_FRAG, Some(additive), vec![]),
-            comp_mat: material(COMPOSITE_FRAG, Some(alpha), vec![UniformDesc::new("thr", UniformType::Float1)]),
             opaque_mat: material(OPAQUE_FRAG, None, vec![]),
-            fluid: None,
             trail: None,
             colors: Vec::new(),
             nuclei: HashMap::new(),
@@ -306,7 +245,7 @@ impl Renderer {
                         } else {
                             c
                         }
-                    } else if t.fluid || t.custom {
+                    } else if t.custom {
                         t.color
                     } else {
                         Color::new(t.color.r, t.color.g, t.color.b, 0.35)
@@ -316,12 +255,8 @@ impl Renderer {
         }
     }
 
-    fn draw_dots(&self, sim: &Sim, skip_fluid: bool) {
+    fn draw_dots(&self, sim: &Sim) {
         for i in 0..sim.len() {
-            let ty = &sim.types[sim.kind[i] as usize];
-            if skip_fluid && ty.fluid {
-                continue;
-            }
             let r = dot_radius(sim, i);
             let p = sim.pos[i];
             draw_texture_ex(&self.disc, p.x - r, p.y - r, self.colors[i], DrawTextureParams {
@@ -335,7 +270,6 @@ impl Renderer {
         let (w, h) = (screen_width().max(1.0) as u32, screen_height().max(1.0) as u32);
         clear_background(BACKGROUND);
         self.compute_colors(sim, view);
-        let smooth = view.smooth_fluid && sim.kind.iter().any(|&k| sim.types[k as usize].fluid);
 
         // ---- Particles (optionally into the persistent trail image) ----
         if view.trails {
@@ -347,43 +281,14 @@ impl Renderer {
             set_camera(&t.camera());
             let fade = Color::new(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b, view.trail_fade.clamp(0.01, 1.0));
             draw_rectangle(0.0, 0.0, w as f32, h as f32, fade);
-            self.draw_dots(sim, smooth);
+            self.draw_dots(sim);
             set_default_camera();
             gl_use_material(&self.opaque_mat);
             self.trail.as_ref().unwrap().blit();
             gl_use_default_material();
         } else {
             self.trail = None;
-            self.draw_dots(sim, smooth);
-        }
-
-        // ---- Liquids as a surface: splat blobs, then threshold ----
-        if smooth {
-            Target::ensure(&mut self.fluid, w, h);
-            let t = self.fluid.as_ref().unwrap();
-            set_camera(&t.camera());
-            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
-            gl_use_material(&self.blob_mat);
-            for i in 0..sim.len() {
-                let ty = &sim.types[sim.kind[i] as usize];
-                if !ty.fluid {
-                    continue;
-                }
-                let r = ty.radius * 2.3;
-                let p = sim.pos[i];
-                draw_texture_ex(&self.blob, p.x - r, p.y - r, self.colors[i], DrawTextureParams {
-                    dest_size: Some(vec2(2.0 * r, 2.0 * r)),
-                    ..Default::default()
-                });
-            }
-            gl_use_default_material();
-            set_default_camera();
-            self.comp_mat.set_uniform("thr", 0.13f32);
-            gl_use_material(&self.comp_mat);
-            t.blit();
-            gl_use_default_material();
-        } else {
-            self.fluid = None;
+            self.draw_dots(sim);
         }
 
         // ---- Walls ----

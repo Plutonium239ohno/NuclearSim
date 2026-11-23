@@ -8,7 +8,6 @@ pub mod reactions;
 pub mod reactor;
 pub mod thermal;
 pub mod walls;
-pub mod scenes;
 pub mod render;
 pub mod skin;
 pub mod gui;

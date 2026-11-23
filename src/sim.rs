@@ -165,50 +165,7 @@ struct Table {
     rules: Vec<f32>,
     ghost: Vec<bool>,
     collides: Vec<bool>,
-    fluid: Vec<bool>,
-    viscosity: Vec<f32>,
-    cohesion: Vec<f32>,
-    /// Largest fluid kernel radius (0 if no fluid types).
-    fluid_h: f32,
-    /// Number of fluid particles currently alive.
-    n_fluid: usize,
     max_radius: f32,
-}
-
-// ---- Position-based fluids (Macklin & Müller 2013, number-density variant
-// of Solenthaler & Pajarola 2008 so fluids of different mass coexist) ----
-//
-// Kernel radius for a pair is h = 2 (ri + rj): twice the contact distance.
-// Density uses the poly6 shape, its gradient the spiky shape (no clustering).
-
-/// Unnormalized poly6 kernel, argument q^2 = r^2 / h^2.
-#[inline(always)]
-fn w_poly(q2: f32) -> f32 {
-    let x = 1.0 - q2;
-    x * x * x
-}
-
-/// dW/dr of the spiky kernel, scaled to match `w_poly`'s normalization.
-#[inline(always)]
-fn dw_spiky(q: f32, h: f32) -> f32 {
-    let x = 1.0 - q;
-    -7.5 * x * x / h
-}
-
-/// Number density of a hexagonal packing at contact spacing (self + 6 at
-/// q=1/2 + 6 at q=sqrt(3)/2): the fluid's rest state.
-const REST_DENSITY: f32 = 1.0 + 6.0 * 0.421875 + 6.0 * 0.015625;
-/// Surface-tension acceleration at cohesion 1 (px/s^2).
-const COHESION_ACCEL: f32 = 1000.0;
-/// Max fluid neighbours kept per particle (hex packing has 12 within h;
-/// compressed flow rarely exceeds ~30).
-const MAX_NB: usize = 32;
-
-/// One fluid neighbour: index and 1/h for the pair.
-#[derive(Clone, Copy, Default)]
-struct Nb {
-    j: u32,
-    inv_h: f32,
 }
 
 #[derive(Default)]
@@ -290,16 +247,6 @@ pub struct Sim {
     buf_tag: Vec<u32>,
     buf_zn: Vec<u32>,
     buf_far: Vec<Vec2>,
-    lambda: Vec<f32>,
-    /// Fluid neighbour lists, rebuilt every substep: nb[i*MAX_NB..][..nb_len[i]].
-    nb: Vec<Nb>,
-    nb_len: Vec<u8>,
-    /// Kernel gradient per neighbour slot, written by the lambda pass and
-    /// reused by the position pass of the same iteration.
-    nb_grad: Vec<Vec2>,
-    /// Fluid particle has a colliding non-fluid particle nearby (else the
-    /// contact scan is skipped for it).
-    near_solid: Vec<bool>,
 
     pub(crate) grid: Grid,
     /// User-drawn static walls.
@@ -362,11 +309,6 @@ impl Sim {
             buf_tag: Vec::new(),
             buf_zn: Vec::new(),
             buf_far: Vec::new(),
-            lambda: Vec::new(),
-            nb: Vec::new(),
-            nb_len: Vec::new(),
-            nb_grad: Vec::new(),
-            near_solid: Vec::new(),
             grid: Grid::default(),
             walls: Walls::default(),
             sources: Sources::default(),
@@ -622,7 +564,7 @@ impl Sim {
         if self.types.len() >= crate::types::MAX_TYPES {
             return None;
         }
-        let n_custom = self.types.iter().filter(|t| t.custom && !t.fluid).count();
+        let n_custom = self.types.iter().filter(|t| t.custom).count();
         let name = format!("Species {}", (b'A' + n_custom as u8) as char);
         let hue = (n_custom as f32 * 137.5 + 130.0) % 360.0;
         self.types.push(ParticleType::custom(&name, hue, 4.0, 1.0, 0.0));
@@ -791,14 +733,6 @@ impl Sim {
                 .enumerate()
                 .map(|(k, t)| t.collides && !t.ghost && !(self.point_nuclei && k == ids::NEUTRON as usize))
                 .collect(),
-            fluid: self.types.iter().map(|t| t.fluid && !t.ghost).collect(),
-            viscosity: self.types.iter().map(|t| t.viscosity.clamp(0.0, 1.0)).collect(),
-            cohesion: self.types.iter().map(|t| t.cohesion).collect(),
-            fluid_h: self.types.iter().filter(|t| t.fluid).map(|t| 4.0 * t.radius).fold(0.0, f32::max),
-            n_fluid: {
-                let f: Vec<bool> = self.types.iter().map(|t| t.fluid && !t.ghost).collect();
-                self.kind.iter().filter(|&&k| f[k as usize]).count()
-            },
             radius,
             max_radius,
         }
@@ -1160,7 +1094,7 @@ impl Sim {
         std::mem::swap(&mut self.pos, &mut self.buf_pos);
     }
 
-    /// Resolve overlaps, fluid density and walls on positions, then derive
+    /// Resolve overlaps and walls on positions, then derive
     /// velocity from the actual displacement (position-based dynamics). This is
     /// what lets dense piles come to rest instead of jittering.
     ///
@@ -1168,18 +1102,11 @@ impl Sim {
     /// contacts and writes only itself, so it's embarrassingly parallel and
     /// deterministic. Contact corrections are averaged over the contact count
     /// so a particle squeezed from k sides doesn't overshoot.
-    ///
-    /// Fluid particles don't collide with each other. Instead each one keeps
-    /// its neighbourhood at rest density (position-based fluids): a per-
-    /// particle Lagrange multiplier `lambda` is solved first, then the
-    /// positions are moved along the density gradient.
     fn solve_positions(&mut self, t: &Table, h: f32) {
         let collisions = self.cfg.collisions;
-        let fluid_on = t.n_fluid > 0;
         let (w, hgt) = (self.width, self.height);
-        let iters = if collisions || fluid_on { self.cfg.iterations.max(1) } else { 1 };
+        let iters = if collisions { self.cfg.iterations.max(1) } else { 1 };
         const OMEGA: f32 = 1.5; // over-relaxation; Jacobi averaging under-corrects otherwise
-        let fluid_reach = (t.fluid_h * 1.05 * self.grid.inv).ceil().max(1.0) as i32;
         // Inserted control rods: solid to everything but free neutrons.
         let rods = if self.cfg.nuclear { self.reactor.rects() } else { Vec::new() };
         let rods = &rods[..];
@@ -1188,60 +1115,9 @@ impl Sim {
         // Keep the predicted (pre-solve) positions: the restitution pass needs
         // to know which pairs were in contact before they got pushed apart.
         self.pred_pos.clone_from(&self.pos);
-        self.lambda.resize(self.pos.len(), 0.0);
-        if fluid_on {
-            self.build_fluid_neighbours(t, fluid_reach);
-        }
 
         for _ in 0..iters {
-            if fluid_on {
-                let (pos, kind, nb, nb_len) = (&self.pos, &self.kind, &self.nb, &self.nb_len);
-                self.lambda
-                    .par_iter_mut()
-                    .zip(self.nb_grad.par_chunks_mut(MAX_NB))
-                    .enumerate()
-                    .with_min_len(64)
-                    .for_each(|(i, (lam, grads))| {
-                    let ti = kind[i] as usize;
-                    if !t.fluid[ti] {
-                        *lam = 0.0;
-                        return;
-                    }
-                    let p = pos[i];
-                    let ri = t.radius[ti];
-                    let mut dens = 1.0; // self
-                    let mut grad_i = Vec2::ZERO;
-                    let mut sum_g2 = 0.0;
-                    let len = nb_len[i] as usize;
-                    for (e, gs) in nb[i * MAX_NB..i * MAX_NB + len].iter().zip(grads[..len].iter_mut()) {
-                        let j = e.j as usize;
-                        let d = p - pos[j];
-                        let q2 = d.length_squared() * (e.inv_h * e.inv_h);
-                        if q2 >= 1.0 || q2 < 1e-12 {
-                            *gs = Vec2::ZERO;
-                            continue;
-                        }
-                        let q = q2.sqrt();
-                        dens += w_poly(q2);
-                        let g = d * (dw_spiky(q, 1.0) * e.inv_h * e.inv_h / q);
-                        *gs = g;
-                        grad_i += g;
-                        sum_g2 += t.inv_mass[kind[j] as usize] * g.length_squared();
-                    }
-                    let c = (dens / REST_DENSITY - 1.0).max(0.0);
-                    if c == 0.0 {
-                        *lam = 0.0;
-                        return;
-                    }
-                    let h0 = 4.0 * ri;
-                    let denom = (t.inv_mass[ti] * grad_i.length_squared() + sum_g2) / (REST_DENSITY * REST_DENSITY)
-                        + 0.3 / (h0 * h0);
-                    *lam = -c / denom;
-                });
-            }
-
-            let (pos, prev, kind, grid, lambda, walls) =
-                (&self.pos, &self.prev_pos, &self.kind, &self.grid, &self.lambda, &self.walls);
+            let (pos, prev, kind, grid, walls) = (&self.pos, &self.prev_pos, &self.kind, &self.grid, &self.walls);
             let nuc = &self.nuc;
             // Nuclei act as rigid bodies in collisions with anything outside
             // them (other nuclei, walls): the contact moves the whole nucleus,
@@ -1264,7 +1140,6 @@ impl Sim {
             let hit = |i: usize| hits[i];
             self.int_corr.resize(pos.len(), Vec2::ZERO);
             self.ext.resize(pos.len(), (Vec2::ZERO, 0.0));
-            let (nb, nb_len, nb_grad, near_solid) = (&self.nb, &self.nb_len, &self.nb_grad, &self.near_solid);
             self.buf_pos.resize(pos.len(), Vec2::ZERO);
             self.buf_pos
                 .par_iter_mut()
@@ -1286,30 +1161,20 @@ impl Sim {
                 let ri = t.radius[ti];
                 let im_i = t.inv_mass[ti];
                 let wb_i = inv_body(i, ti);
-                let i_fluid = t.fluid[ti];
-                let i_collides = collisions && t.collides[ti] && (!i_fluid || near_solid[i]);
+                let i_collides = collisions && t.collides[ti];
 
                 let mut dp_int = Vec2::ZERO;
                 let mut n_int = 0u32;
                 let mut dp_ext = Vec2::ZERO;
                 let mut n_ext = 0u32;
                 let mut groups = Groups::new();
-                let mut dp_fluid = Vec2::ZERO;
-                if i_fluid {
-                    let lam_i = lambda[i];
-                    let r = i * MAX_NB..i * MAX_NB + nb_len[i] as usize;
-                    for (e, g) in nb[r.clone()].iter().zip(&nb_grad[r]) {
-                        dp_fluid += *g * (lam_i + lambda[e.j as usize]);
-                    }
-                }
                 if i_collides {
                     grid.for_each_near(p, 1, |j| {
                         if j == i {
                             return;
                         }
                         let tj = kind[j] as usize;
-                        // Fluid-fluid pairs are handled by the density constraint.
-                        if !t.collides[tj] || (i_fluid && t.fluid[tj]) {
+                        if !t.collides[tj] {
                             return;
                         }
                         let d = p - pos[j];
@@ -1342,9 +1207,6 @@ impl Sim {
                 // exactly (overshooting it injects energy).
                 let relax = |n: u32| (OMEGA / n.max(1) as f32).min(1.0);
                 let mut corr = dp_int * relax(n_int);
-                if i_fluid {
-                    corr += dp_fluid * (im_i / REST_DENSITY);
-                }
                 if !i_multi {
                     let (g, nb) = groups.total();
                     corr += g * relax(nb);
@@ -1439,106 +1301,11 @@ impl Sim {
                 *v = clamp_speed((pos[i] - prev[i]) * inv_h, vmax);
             }
         });
-
-        if fluid_on {
-            self.viscosity(t, h);
-        }
-    }
-
-    /// Per-substep neighbour lists for fluid particles (fluid neighbours only),
-    /// so the solver iterations don't rescan the grid.
-    fn build_fluid_neighbours(&mut self, t: &Table, reach: i32) {
-        let n = self.pos.len();
-        self.nb.resize(n * MAX_NB, Nb::default());
-        self.nb_grad.resize(n * MAX_NB, Vec2::ZERO);
-        self.nb_len.resize(n, 0);
-        self.near_solid.resize(n, false);
-        let (pos, kind, grid) = (&self.pos, &self.kind, &self.grid);
-        self.nb
-            .par_chunks_mut(MAX_NB)
-            .zip(self.nb_len.par_iter_mut())
-            .zip(self.near_solid.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((list, len), solid))| {
-                *len = 0;
-                *solid = false;
-                let ti = kind[i] as usize;
-                if !t.fluid[ti] {
-                    return;
-                }
-                let p = pos[i];
-                let ri = t.radius[ti];
-                let mut k = 0usize;
-                grid.for_each_near(p, reach, |j| {
-                    let tj = kind[j] as usize;
-                    if j == i {
-                        return;
-                    }
-                    if !t.fluid[tj] {
-                        *solid |= t.collides[tj];
-                        return;
-                    }
-                    if k == MAX_NB {
-                        return;
-                    }
-                    // A little slack: positions move during the iterations.
-                    let hh = 2.0 * (ri + t.radius[tj]);
-                    let slack = hh * 1.05;
-                    if (pos[j] - p).length_squared() < slack * slack {
-                        list[k] = Nb { j: j as u32, inv_h: 1.0 / hh };
-                        k += 1;
-                    }
-                });
-                *len = k as u8;
-            });
-    }
-
-    /// XSPH viscosity: blend each fluid particle's velocity towards the
-    /// kernel-weighted average of its fluid neighbours. Also applies surface
-    /// tension: same-fluid neighbours attract between contact and the kernel
-    /// edge (peak at 3/4 h). Different fluids don't, so they separate.
-    fn viscosity(&mut self, t: &Table, h: f32) {
-        // Per-substep blend factor, normalised so the feel doesn't depend on
-        // the substep count (calibrated at 240 substeps/s).
-        let scale = (h * 240.0).min(1.0);
-        let (pos, vel, kind, nb, nb_len) = (&self.pos, &self.vel, &self.kind, &self.nb, &self.nb_len);
-        self.buf_vel.resize(pos.len(), Vec2::ZERO);
-        self.buf_vel.par_iter_mut().enumerate().for_each(|(i, nv)| {
-            let ti = kind[i] as usize;
-            let v = vel[i];
-            if !t.fluid[ti] {
-                *nv = v;
-                return;
-            }
-            let p = pos[i];
-            let mut acc = Vec2::ZERO;
-            let mut wsum = 1.0;
-            let mut pull = Vec2::ZERO;
-            for e in &nb[i * MAX_NB..i * MAX_NB + nb_len[i] as usize] {
-                let j = e.j as usize;
-                let tj = kind[j] as usize;
-                let d = pos[j] - p;
-                let q2 = d.length_squared() * (e.inv_h * e.inv_h);
-                if q2 >= 1.0 {
-                    continue;
-                }
-                let wk = w_poly(q2);
-                let c = 0.5 * (t.viscosity[ti] + t.viscosity[tj]);
-                acc += (vel[j] - v) * (wk * c);
-                wsum += wk;
-                if tj == ti && q2 > 0.25 {
-                    let q = q2.sqrt();
-                    pull += d * (16.0 * (q - 0.5) * (1.0 - q) / (q / e.inv_h));
-                }
-            }
-            *nv = v + acc * (scale / wsum) + pull * (t.cohesion[ti] * COHESION_ACCEL * h);
-        });
-        std::mem::swap(&mut self.vel, &mut self.buf_vel);
     }
 
     /// Restitution: for contacts that were approaching fast before the solve,
     /// set the separating normal speed to e * approach speed. Slow (resting)
-    /// contacts are left inelastic so piles settle. Fluids never bounce.
+    /// contacts are left inelastic so piles settle.
     /// Nuclei bounce as rigid bodies (their velocity and total mass), so
     /// nucleus-nucleus and neutron-nucleus collisions are properly elastic.
     fn solve_velocities(&mut self, t: &Table, h: f32) {
@@ -1607,7 +1374,7 @@ impl Sim {
             let mut v = vel[i];
             *ext = (Vec2::ZERO, 0.0);
             let ti = kind[i] as usize;
-            if t.ghost[ti] || t.fluid[ti] {
+            if t.ghost[ti] {
                 *nv = v;
                 return;
             }

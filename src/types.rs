@@ -37,14 +37,6 @@ pub struct ParticleType {
     pub in_random_spawn: bool,
     /// Hue, only meaningful for custom species (drives `color`).
     pub hue: f32,
-    /// Liquid (position-based fluid): fluid particles don't collide with
-    /// each other, they keep a rest density instead (see sim.rs).
-    pub fluid: bool,
-    /// XSPH velocity smoothing towards neighbours, 0..1 (water ~0.05, honey ~0.5).
-    pub viscosity: f32,
-    /// Surface tension: attraction to neighbours of the *same* fluid. Different
-    /// fluids don't attract each other, so they separate (oil and water).
-    pub cohesion: f32,
 }
 
 impl ParticleType {
@@ -60,9 +52,6 @@ impl ParticleType {
             custom: false,
             in_random_spawn: true,
             hue: 0.0,
-            fluid: false,
-            viscosity: 0.0,
-            cohesion: 0.0,
         }
     }
 
@@ -78,19 +67,7 @@ impl ParticleType {
             custom: true,
             in_random_spawn: true,
             hue,
-            fluid: false,
-            viscosity: 0.0,
-            cohesion: 0.0,
         }
-    }
-
-    pub fn liquid(name: &str, hue: f32, radius: f32, mass: f32, viscosity: f32, cohesion: f32) -> Self {
-        let mut t = Self::custom(name, hue, radius, mass, 0.0);
-        t.fluid = true;
-        t.viscosity = viscosity;
-        t.cohesion = cohesion;
-        t.in_random_spawn = false;
-        t
     }
 
     pub fn is_nucleon(kind: u8) -> bool {
@@ -129,8 +106,6 @@ pub fn default_types() -> Vec<ParticleType> {
         ParticleType::custom("Species B", 280.0, 4.0, 1.0, 0.0),
         ParticleType::custom("Species C", 185.0, 3.0, 0.5, 0.0),
         ParticleType::custom("Species D", 40.0, 6.0, 3.0, 0.0),
-        ParticleType::liquid("Water", 205.0, 3.0, 1.0, 0.04, 0.5),
-        ParticleType::liquid("Oil", 42.0, 3.5, 0.6, 0.08, 0.5),
     ]
 }
 

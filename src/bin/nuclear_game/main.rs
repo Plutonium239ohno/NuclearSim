@@ -248,7 +248,7 @@ async fn main() {
         fill_gap: 4.0,
         force_strength: 3000.0,
         force_radius: 150.0,
-        view: View { mode: ViewMode::Element, smooth_fluid: false, ..View::default() },
+        view: View { mode: ViewMode::Element, ..View::default() },
         save_name: "my scene".into(),
         message: None,
         step_ms: 0.0,

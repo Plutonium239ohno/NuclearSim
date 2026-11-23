@@ -108,8 +108,6 @@ pub struct Actions {
     pub clear: bool,
     pub clear_walls: bool,
     pub spawn: bool,
-    pub dam_break: bool,
-    pub oil_water: bool,
     pub new_world: bool,
 }
 
@@ -205,7 +203,7 @@ fn species_list(ui: &mut Gui, sim: &Sim, sel: u8, key: &str) -> Option<u8> {
         draw_rectangle_lines(r.x, r.y, r.w, r.h, 1.0, if on { col::ACCENT } else { col::EDGE });
         draw_circle(r.x + 14.0, r.y + 13.0, (t.radius * 1.3).clamp(3.0, 9.0), t.color);
         ui.text(&t.name, r.x + 30.0, r.y + 4.0, ui.size - 1.0, col::TEXT);
-        let tag = format!("{}{}", if t.fluid { "liquid   " } else { "" }, counts[k as usize]);
+        let tag = counts[k as usize].to_string();
         let tw = ui.text_width(&tag, ui.size - 3.0);
         ui.text(&tag, r.x + r.w - tw - 8.0, r.y + 6.0, ui.size - 3.0, col::DIM);
         if clicked {
@@ -274,12 +272,6 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, app: &mut App, act: &mut Actions) {
         act.new_world = true;
     }
     ui.note("Random interaction matrix, freshly spawned particles: particle life.");
-    match ui.buttons(&["Dam break", "Oil & water"]) {
-        Some(0) => act.dam_break = true,
-        Some(1) => act.oil_water = true,
-        _ => {}
-    }
-    ui.note("The liquid scenes turn gravity on and the interaction rules off.");
 }
 
 fn species_tab(ui: &mut Gui, sim: &mut Sim, app: &mut App) {
@@ -344,12 +336,6 @@ fn species_tab(ui: &mut Gui, sim: &mut Sim, app: &mut App) {
     ui.note("Charge only matters with Electric force on (Physics tab).");
     ui.checkbox("Collides (bumps into other particles)", &mut t.collides);
     ui.checkbox("In random spawn", &mut t.in_random_spawn);
-    ui.checkbox("Liquid", &mut t.fluid);
-    if t.fluid {
-        ui.slider("Viscosity", &mut t.viscosity, 0.0, 1.0, Scale::Lin, 0.05, |v| format!("{v:.2}"));
-        ui.slider("Surface tension", &mut t.cohesion, 0.0, 2.0, Scale::Lin, 0.5, |v| format!("{v:.2}"));
-        ui.note("Liquids keep a constant density instead of bouncing; different liquids don't mix (oil and water). They need gravity to settle.");
-    }
     let count = sim.kind.iter().filter(|&&x| x == k).count();
     if ui.button(&format!("Remove its {count} particles")) {
         let kind = sim.kind.clone();
@@ -496,7 +482,7 @@ fn matrix_tab(ui: &mut Gui, sim: &mut Sim, app: &mut App, act: &mut Actions) {
         Some(5) => act.new_world = true,
         _ => {}
     }
-    ui.note("Randomize leaves liquids at 0 (they're for the gravity scenes). Self-attract sets the diagonal (each species to itself) to +0.8: clumps. Random world also respawns the particles.");
+    ui.note("Self-attract sets the diagonal (each species to itself) to +0.8: clumps. Random world also respawns the particles.");
 
     ui.heading("Strength");
     let d = Config::default();
@@ -581,7 +567,6 @@ fn view_tab(ui: &mut Gui, app: &mut App) {
     if app.view.trails {
         ui.slider("Trail fade", &mut app.view.trail_fade, 0.01, 0.5, Scale::Log, 0.08, |v| format!("{v:.2}"));
     }
-    ui.checkbox("Smooth liquid surfaces", &mut app.view.smooth_fluid);
     ui.heading("Zoom  [Z]");
     ui.note("Z opens a magnifier that follows the mouse. Click to lock it; then the mouse works inside the window (paint, erase, draw, push at the zoomed scale). Scroll to change magnification. Z or Esc closes it.");
     ui.heading("Keys");

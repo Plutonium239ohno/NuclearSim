@@ -27,6 +27,10 @@ pub struct Actions {
     pub refuel_all: bool,
     /// Switch to point nuclei (true) or nucleon clusters (false).
     pub point_mode: Option<bool>,
+    pub undo: bool,
+    pub redo: bool,
+    pub new_seed: bool,
+    pub export_graphs: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,11 +71,12 @@ pub struct PanelState {
     /// Filter the cache was built for, and how many events it has seen.
     cache_key: (usize, String),
     seen: u64,
+    seed_text: String,
 }
 
 impl Default for PanelState {
     fn default() -> Self {
-        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0 }
+        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new() }
     }
 }
 
@@ -223,11 +228,13 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
     ui.text(&fps, w - pad - fw, 13.0, 14.0, col::DIM);
     ui.space(30.0);
     let pause = if g.paused { "▶ Resume" } else { "Pause" };
-    match ui.buttons(&[pause, "Step", "Clear", "Hide"]) {
+    match ui.buttons(&[pause, "Step", "Undo", "Redo", "Clear", "Hide"]) {
         Some(0) => g.paused = !g.paused,
         Some(1) => g.step_once = true,
-        Some(2) => act.clear = true,
-        Some(3) => g.panel_open = false,
+        Some(2) => act.undo = true,
+        Some(3) => act.redo = true,
+        Some(4) => act.clear = true,
+        Some(5) => g.panel_open = false,
         _ => {}
     }
     ui.slider("Simulation speed   [ / ]", &mut g.time_scale, 0.05, 2.0, Scale::Log, 1.0, |v| format!("×{v:.2}"));
@@ -268,7 +275,10 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
                 Tab::Reactor => reactor_tab(ui, sim, &mut act),
                 Tab::View => view_tab(ui, g),
                 Tab::Scenes => scenes_tab(ui, g, saved, &mut act),
-                Tab::Physics => physics_tab(ui, sim, &mut act),
+                Tab::Physics => {
+                    repeatable_section(ui, sim, g, ps, &mut act);
+                    physics_tab(ui, sim, &mut act)
+                }
                 Tab::Log => {}
             }
             ui.space(16.0);
@@ -532,6 +542,7 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
     let power = re.power();
     let period = re.period();
     let neutrons = re.samples.back().map(|s| s.neutrons).unwrap_or(0);
+    let recorded = re.recording.len();
     let (state, sc) = match period {
         _ if (neutrons == 0 && power == 0.0) || (re.insertion >= 0.99 && !re.rods.is_empty()) => ("SHUT DOWN", col::DIM),
         Some(p) if p.is_finite() && p > 0.0 && p < 15.0 => ("SUPERCRITICAL", col::BAD),
@@ -561,6 +572,10 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
     ui.text(&sub, r.x + 10.0, r.y + 30.0, 14.0, col::DIM);
 
     plot(ui, sim);
+    if ui.button(&format!("Export graphs (CSV, {:.0} s recorded)", recorded as f32 * SAMPLE_DT)) {
+        act.export_graphs = true;
+    }
+    ui.note("Every sample since the scene was loaded: time, free neutrons, fissions/s, thermal power, rod position, mean temperature, hottest wall. Saved next to the scenes folder (logs).");
 
     if !sim.reactor.rods.is_empty() {
         ui.heading("Control rods  [↑ / ↓,  X = SCRAM]");
@@ -763,6 +778,19 @@ fn view_tab(ui: &mut Gui, g: &mut Game) {
     if g.view.trails {
         ui.slider("Trail fade", &mut g.view.trail_fade, 0.01, 0.5, Scale::Log, 0.08, |v| format!("{v:.2}"));
     }
+    ui.heading("Overlay  [O]");
+    use sim_core::overlay::OverlayKind;
+    let names: Vec<&str> = OverlayKind::ALL.iter().map(|k| k.name()).collect();
+    let mut k = OverlayKind::ALL.iter().position(|&o| o == g.view.overlay).unwrap_or(0);
+    if ui.segmented(&names, &mut k, 2) {
+        g.view.overlay = OverlayKind::ALL[k];
+    }
+    ui.note(match g.view.overlay {
+        OverlayKind::None => "Colour the scene by a field, averaged over the last second or two of sim time.",
+        OverlayKind::Temperature => "Temperature of the matter: random motion of the nuclei relative to the local flow (pumped salt isn't counted as hot). Logarithmic scale from the ambient temperature.",
+        OverlayKind::Flux => "Where neutrons travel: track length per area per time, all energies. Square-root scale, relative to the brightest spot.",
+        OverlayKind::ThermalFlux => "The same for slow neutrons only (below 1 eV): where the moderator has done its job, and what the fuel and the rods see.",
+    });
     ui.heading("Zoom  [Z]");
     ui.note("Z opens a magnifier that follows the mouse. Click to lock it; then the mouse works inside the window (place, launch, erase at the zoomed scale). Scroll to change magnification. Z or Esc closes it.");
 }
@@ -973,4 +1001,43 @@ pub fn export(sim: &Sim, ps: &PanelState, all: bool) -> String {
         Ok(n) => format!("Exported {n} events to {}", path.display()),
         Err(e) => format!("Export failed: {e}"),
     }
+}
+
+/// Seed, fixed time step: runs that repeat exactly.
+fn repeatable_section(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, act: &mut Actions) {
+    ui.heading("Repeatable runs");
+    if !ui.typing() {
+        ps.seed_text = sim.seed.to_string();
+    }
+    let r = ui.text_field("Seed", &mut ps.seed_text, "number");
+    if r.submitted || r.changed {
+        if let Ok(v) = ps.seed_text.trim().parse::<u64>() {
+            sim.seed = v;
+        }
+    }
+    if ui.button("New seed") {
+        act.new_seed = true;
+    }
+    ui.checkbox("Fixed time step (1/60 s per frame)", &mut g.fixed_step);
+    ui.checkbox("Keep this seed when loading a scenario", &mut g.keep_seed);
+    ui.note("Every random event (decays, reactions, scattering) is drawn from the seed and the step number. The same scene and seed, run with a fixed time step and without touching it, plays out exactly the same: saved scenes keep their seed, so loading one again replays it. Without the fixed step, the frame rate decides the step sizes.");
+}
+
+/// Colour scale of the overlay, bottom right of the screen.
+pub fn draw_legend(ui: &Gui, sim: &Sim, overlay: &sim_core::overlay::Overlay) {
+    let Some((title, lo, hi)) = overlay.legend(sim) else { return };
+    let (w, h) = (230.0, 50.0);
+    let (x, y) = (screen_width() - w - 12.0, screen_height() - h - 12.0);
+    draw_rectangle(x, y, w, h, Color::new(0.06, 0.065, 0.09, 0.85));
+    draw_rectangle_lines(x, y, w, h, 1.0, col::EDGE);
+    ui.text(&title, x + 8.0, y + 5.0, 14.0, col::TEXT);
+    let (bx, by, bw) = (x + 8.0, y + 24.0, w - 16.0);
+    let n = 40;
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        draw_rectangle(bx + bw * i as f32 / n as f32, by, bw / n as f32 + 0.5, 8.0, sim_core::render::heat(t));
+    }
+    ui.text(&lo, bx, by + 10.0, 12.0, col::DIM);
+    let tw = ui.text_width(&hi, 12.0);
+    ui.text(&hi, bx + bw - tw, by + 10.0, 12.0, col::DIM);
 }

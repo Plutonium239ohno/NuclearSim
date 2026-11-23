@@ -4,6 +4,7 @@
 
 mod panel;
 use sim_core::gui;
+use sim_core::history::History;
 use sim_core::zoom::{Zoom, ZoomState};
 
 use sim_core::game_scenes as scenes;
@@ -128,6 +129,13 @@ pub struct Game {
     pub save_name: String,
     pub message: Option<(String, f64)>,
     pub step_ms: f32,
+    /// Undo / redo snapshots of the scene.
+    pub history: History,
+    /// Step by exactly 1/60 s × speed each frame, whatever the frame rate:
+    /// with the seed, runs repeat exactly.
+    pub fixed_step: bool,
+    /// Keep the current seed when a scenario is loaded (else a new one is drawn).
+    pub keep_seed: bool,
 }
 
 impl Game {
@@ -212,6 +220,54 @@ fn part_info(sim: &Sim, p: Vec2, pick: f32) -> Option<Vec<String>> {
 }
 
 /// Switch the nucleus model, converting the scene.
+/// A fresh random seed (from the clock).
+pub fn new_seed() -> u64 {
+    sim_core::rng::mix(miniquad::date::now().to_bits()) % 1_000_000
+}
+
+/// Snapshot the scene for undo, before changing it.
+pub fn snapshot(sim: &Sim, g: &mut Game) {
+    g.history.record(scenes::to_text(sim));
+}
+
+/// Put back a snapshot, keeping the event log, the counters and the
+/// reactor graphs (undo rewinds the scene, not the record of what happened).
+fn restore(sim: &mut Sim, text: &str) {
+    let old = std::mem::take(&mut sim.nuclear);
+    let samples = std::mem::take(&mut sim.reactor.samples);
+    let recording = std::mem::take(&mut sim.reactor.recording);
+    if let Err(e) = scenes::from_text(sim, text) {
+        eprintln!("undo: {e}");
+    }
+    let ns = &mut sim.nuclear;
+    ns.counts = old.counts;
+    ns.captures = old.captures;
+    ns.fusions = old.fusions;
+    ns.fissions = old.fissions;
+    ns.annihilations = old.annihilations;
+    ns.energy_released = old.energy_released;
+    ns.log = old.log;
+    ns.history = old.history;
+    ns.dropped = old.dropped;
+    ns.time = old.time;
+    ns.log_breakups = old.log_breakups;
+    sim.reactor.samples = samples;
+    sim.reactor.recording = recording;
+    sim.index_nuclei();
+}
+
+fn undo(sim: &mut Sim, g: &mut Game, redo: bool) {
+    let now = scenes::to_text(sim);
+    let state = if redo { g.history.redo(now) } else { g.history.undo(now) };
+    match state {
+        Some(t) => {
+            restore(sim, &t);
+            g.say(if redo { "Redo" } else { "Undo" });
+        }
+        None => g.say(if redo { "Nothing to redo" } else { "Nothing to undo" }),
+    }
+}
+
 fn set_points(sim: &mut Sim, g: &mut Game, on: bool) {
     let lost = sim_core::nuclear::set_point_mode(sim, on);
     g.say(match (on, lost) {
@@ -252,6 +308,9 @@ async fn main() {
         save_name: "my scene".into(),
         message: None,
         step_ms: 0.0,
+        history: History::default(),
+        fixed_step: false,
+        keep_seed: false,
     };
     let mut saved = scenes::list_scenes();
     let mut zoom = Zoom::default();
@@ -265,11 +324,20 @@ async fn main() {
     let auto_shot = std::env::var("PARTICLE_SIM_SHOT").ok();
     let shot_frame: u64 = std::env::var("PARTICLE_SIM_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(240);
     sim.point_nuclei = std::env::var("PARTICLE_SIM_POINTS").is_ok();
+    // PARTICLE_SIM_SEED=<n> fixes the seed (repeatable automation).
+    sim.seed = std::env::var("PARTICLE_SIM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(new_seed);
     if let Some(k) = std::env::var("PARTICLE_SIM_SCENE").ok().and_then(|s| s.parse::<usize>().ok()) {
         scenes::load_preset(&mut sim, k);
     } else {
         scenes::load_preset(&mut sim, 4);
     }
+    // PARTICLE_SIM_OVERLAY=temp|flux|thermal
+    g.view.overlay = match std::env::var("PARTICLE_SIM_OVERLAY").as_deref() {
+        Ok("temp") => sim_core::overlay::OverlayKind::Temperature,
+        Ok("flux") => sim_core::overlay::OverlayKind::Flux,
+        Ok("thermal") => sim_core::overlay::OverlayKind::ThermalFlux,
+        _ => sim_core::overlay::OverlayKind::None,
+    };
     if let Ok(t) = std::env::var("PARTICLE_SIM_TAB") {
         ps.tab = match t.as_str() {
             "reactor" => panel::Tab::Reactor,
@@ -342,7 +410,8 @@ async fn main() {
             }
         }
         let left = if g.panel_open { panel::PANEL_W } else { 0.0 };
-        let dst = zoom.dst(left);
+        let screen_rect = Rect::new(0.0, 0.0, screen_width(), screen_height());
+        let dst = zoom.dst(left, screen_rect);
         let in_window = zoom.state == ZoomState::Locked && dst.contains(screen_mouse);
         if zoom.state != ZoomState::Off && wheel != 0.0 && !over_ui && (zoom.state == ZoomState::Aiming || in_window) {
             zoom.factor = (zoom.factor * if wheel > 0.0 { 1.25 } else { 0.8 }).clamp(1.5, 24.0);
@@ -358,6 +427,10 @@ async fn main() {
         // ---- Tools ----
         let lmb_pressed = !blocked && is_mouse_button_pressed(MouseButton::Left);
         let lmb_down = !blocked && is_mouse_button_down(MouseButton::Left);
+        // Anything the left button does to the scene can be undone.
+        if lmb_pressed && g.tool != Tool::Force {
+            snapshot(&sim, &mut g);
+        }
         match g.tool {
             Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner => {
                 if lmb_pressed {
@@ -535,7 +608,8 @@ async fn main() {
 
         // ---- Simulate ----
         if !g.paused || g.step_once {
-            let dt = get_frame_time().clamp(1.0 / 240.0, 1.0 / 30.0) * if g.step_once { 1.0 } else { g.time_scale };
+            let frame_dt = if g.fixed_step { 1.0 / 60.0 } else { get_frame_time().clamp(1.0 / 240.0, 1.0 / 30.0) };
+            let dt = frame_dt * if g.step_once { 1.0 } else { g.time_scale };
             let t0 = Instant::now();
             sim.step(dt, force);
             g.step_ms = g.step_ms * 0.9 + t0.elapsed().as_secs_f32() * 100.0;
@@ -579,7 +653,7 @@ async fn main() {
             }
         }
 
-        zoom.draw(&mut renderer, &sim, &g.view, left);
+        zoom.draw(&mut renderer, &sim, &g.view, left, screen_rect);
 
         // Cursor.
         if !over_ui && zoom.state != ZoomState::Aiming {
@@ -628,6 +702,8 @@ async fn main() {
             }
         }
 
+        panel::draw_legend(&ui, &sim, &renderer.overlay);
+
         // ---- Panel ----
         let act = panel::draw(&mut ui, &mut sim, &mut g, &mut ps, &mut saved);
         if let Some(t) = ui.tooltip.take() {
@@ -642,10 +718,19 @@ async fn main() {
             if is_key_pressed(KeyCode::Tab) { g.panel_open = !g.panel_open; }
             if is_key_pressed(KeyCode::Space) { g.paused = !g.paused; }
             if is_key_pressed(KeyCode::Period) { g.step_once = true; }
-            if is_key_pressed(KeyCode::C) {
+            let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+            if ctrl && is_key_pressed(KeyCode::Z) {
+                undo(&mut sim, &mut g, shift);
+            }
+            if ctrl && is_key_pressed(KeyCode::Y) {
+                undo(&mut sim, &mut g, true);
+            }
+            if is_key_pressed(KeyCode::C) && !ctrl {
+                snapshot(&sim, &mut g);
                 sim.clear();
                 sim.nuclear.reset();
                 sim.reactor.samples.clear();
+                sim.reactor.recording.clear();
             }
             if is_key_pressed(KeyCode::V) {
                 let all = ViewMode::ALL;
@@ -653,8 +738,15 @@ async fn main() {
                 g.view.mode = all[(k + 1) % all.len()];
             }
             if is_key_pressed(KeyCode::L) { g.view.trails = !g.view.trails; }
+            if is_key_pressed(KeyCode::O) {
+                use sim_core::overlay::OverlayKind;
+                let all = OverlayKind::ALL;
+                let k = all.iter().position(|&o| o == g.view.overlay).unwrap_or(0);
+                g.view.overlay = all[(k + 1) % all.len()];
+            }
             if is_key_pressed(KeyCode::F) { g.tool = Tool::Force; }
             if is_key_pressed(KeyCode::P) {
+                snapshot(&sim, &mut g);
                 let on = !sim.point_nuclei;
                 set_points(&mut sim, &mut g, on);
             }
@@ -663,7 +755,7 @@ async fn main() {
             for (k, t) in TOOL_KEYS {
                 if is_key_pressed(k) { g.tool = t; }
             }
-            if is_key_pressed(KeyCode::Z) {
+            if is_key_pressed(KeyCode::Z) && !ctrl {
                 zoom.toggle();
             }
             if is_key_pressed(KeyCode::Escape) { zoom.state = ZoomState::Off; }
@@ -686,18 +778,44 @@ async fn main() {
             println!("{msg}");
             g.say(msg);
         }
+        if act.undo {
+            undo(&mut sim, &mut g, false);
+        }
+        if act.redo {
+            undo(&mut sim, &mut g, true);
+        }
+        if act.new_seed {
+            sim.seed = new_seed();
+            g.say(format!("New seed {}", sim.seed));
+        }
+        if act.export_graphs {
+            let path = scenes::log_dir().join(format!("reactor-{}.csv", scenes::timestamp()));
+            let msg = match sim_core::reactor::write_samples_csv(&path, &sim.reactor.recording) {
+                Ok(n) => format!("Exported {n} samples ({:.0} s) to {}", n as f32 * sim_core::reactor::SAMPLE_DT, path.display()),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            println!("{msg}");
+            g.say(msg);
+        }
         if let Some(on) = act.point_mode {
+            snapshot(&sim, &mut g);
             set_points(&mut sim, &mut g, on);
         }
         if act.refuel_all {
             sim.reactor.reload_now = true;
         }
         if act.clear {
+            snapshot(&sim, &mut g);
             sim.clear();
             sim.nuclear.reset();
             sim.reactor.samples.clear();
+            sim.reactor.recording.clear();
         }
         if let Some(k) = act.preset {
+            snapshot(&sim, &mut g);
+            if !g.keep_seed {
+                sim.seed = new_seed();
+            }
             scenes::load_preset(&mut sim, k);
             g.say(format!("Loaded: {} - {}", scenes::PRESETS[k].0, scenes::PRESETS[k].1));
         }
@@ -709,6 +827,7 @@ async fn main() {
             saved = scenes::list_scenes();
         }
         if let Some(name) = act.load {
+            snapshot(&sim, &mut g);
             match scenes::load(&mut sim, &name) {
                 Ok(()) => g.say(format!("Loaded {name}")),
                 Err(e) => g.say(format!("Load failed: {e}")),

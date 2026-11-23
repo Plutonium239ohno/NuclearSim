@@ -2,8 +2,9 @@
 //!
 //! Run: cargo run --release --bin nuclear_game
 
-mod gui;
 mod panel;
+use particle_sim::gui;
+use particle_sim::zoom::{Zoom, ZoomState};
 
 use particle_sim::game_scenes as scenes;
 
@@ -97,49 +98,6 @@ fn fill(sim: &mut Sim, r: Rect, z: u32, n: u32, gap: f32) -> u32 {
         row += 1;
     }
     placed
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ZoomState {
-    Off,
-    /// Source square follows the mouse; click to lock it.
-    Aiming,
-    /// Source fixed; the mouse works inside the magnified window.
-    Locked,
-}
-
-struct Zoom {
-    state: ZoomState,
-    /// World point at the centre of the source square.
-    center: Vec2,
-    factor: f32,
-    size: f32,
-}
-
-impl Zoom {
-    fn src(&self) -> Rect {
-        let s = self.size / self.factor;
-        Rect::new(self.center.x - s / 2.0, self.center.y - s / 2.0, s, s)
-    }
-
-    /// The magnified window, on the side of the screen away from the source.
-    fn dst(&self, panel_open: bool) -> Rect {
-        let right = self.center.x < screen_width() * 0.5;
-        let x = if right {
-            screen_width() - self.size - 10.0
-        } else if panel_open {
-            panel::PANEL_W + 25.0
-        } else {
-            10.0
-        };
-        Rect::new(x, 10.0, self.size, self.size)
-    }
-
-    fn clamp_center(&mut self, w: f32, h: f32) {
-        let half = self.size / self.factor / 2.0;
-        self.center.x = self.center.x.clamp(half.min(w / 2.0), (w - half).max(w / 2.0));
-        self.center.y = self.center.y.clamp(half.min(h / 2.0), (h - half).max(h / 2.0));
-    }
 }
 
 pub struct Game {
@@ -296,7 +254,7 @@ async fn main() {
         step_ms: 0.0,
     };
     let mut saved = scenes::list_scenes();
-    let mut zoom = Zoom { state: ZoomState::Off, center: Vec2::ZERO, factor: 4.0, size: 380.0 };
+    let mut zoom = Zoom::default();
     let mut drag_start: Option<(Vec2, Vec2)> = None; // (world, screen)
     let mut wall_last: Option<Vec2> = None;
     let mut wall_start: Option<Vec2> = None;
@@ -383,7 +341,8 @@ async fn main() {
                 click_used = true;
             }
         }
-        let dst = zoom.dst(g.panel_open);
+        let left = if g.panel_open { panel::PANEL_W } else { 0.0 };
+        let dst = zoom.dst(left);
         let in_window = zoom.state == ZoomState::Locked && dst.contains(screen_mouse);
         if zoom.state != ZoomState::Off && wheel != 0.0 && !over_ui && (zoom.state == ZoomState::Aiming || in_window) {
             zoom.factor = (zoom.factor * if wheel > 0.0 { 1.25 } else { 0.8 }).clamp(1.5, 24.0);
@@ -620,15 +579,7 @@ async fn main() {
             }
         }
 
-        // Zoom: source frame + magnified window.
-        if zoom.state != ZoomState::Off {
-            let frame_col = if zoom.state == ZoomState::Locked { Color::new(1.0, 0.85, 0.3, 0.9) } else { Color::new(1.0, 1.0, 1.0, 0.7) };
-            draw_rectangle_lines(src.x, src.y, src.w, src.h, 1.0, frame_col);
-            renderer.draw_region(&sim, &g.view, src, dst);
-            draw_rectangle_lines(dst.x - 1.0, dst.y - 1.0, dst.w + 2.0, dst.h + 2.0, 2.0, frame_col);
-            let hint = if zoom.state == ZoomState::Aiming { "click to lock, scroll to zoom" } else { "Z / Esc to close, scroll to zoom" };
-            draw_text(&format!("x{:.1}  {hint}", zoom.factor), dst.x + 6.0, dst.y + dst.h - 8.0, 16.0, frame_col);
-        }
+        zoom.draw(&mut renderer, &sim, &g.view, left);
 
         // Cursor.
         if !over_ui && zoom.state != ZoomState::Aiming {
@@ -713,7 +664,7 @@ async fn main() {
                 if is_key_pressed(k) { g.tool = t; }
             }
             if is_key_pressed(KeyCode::Z) {
-                zoom.state = if zoom.state == ZoomState::Off { ZoomState::Aiming } else { ZoomState::Off };
+                zoom.toggle();
             }
             if is_key_pressed(KeyCode::Escape) { zoom.state = ZoomState::Off; }
             // Rod bank: arrows drive the rods in 5% steps, X scrams.

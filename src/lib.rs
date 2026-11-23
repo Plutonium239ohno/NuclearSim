@@ -11,4 +11,6 @@ pub mod walls;
 pub mod scenes;
 pub mod render;
 pub mod skin;
+pub mod gui;
+pub mod zoom;
 pub mod game_scenes;

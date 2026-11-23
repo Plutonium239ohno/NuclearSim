@@ -643,6 +643,57 @@ impl Sim {
         }
     }
 
+    /// Remove custom species `k` and all its particles; later species move
+    /// down one id (particles and the rule matrix follow).
+    pub fn remove_species(&mut self, k: u8) {
+        let ku = k as usize;
+        if ku >= self.types.len() || !self.types[ku].custom {
+            return;
+        }
+        let kind = self.kind.clone();
+        self.retain(|i| kind[i] != k);
+        for x in self.kind.iter_mut() {
+            if *x > k {
+                *x -= 1;
+            }
+        }
+        self.types.remove(ku);
+        let n = self.types.len();
+        let mut r = crate::types::RuleMatrix::zero(n);
+        for a in 0..n {
+            for b in 0..n {
+                let (oa, ob) = (a + (a >= ku) as usize, b + (b >= ku) as usize);
+                r.set(a, b, self.rules.get(oa, ob));
+            }
+        }
+        self.rules = r;
+    }
+
+    /// Copy of species `k` (same rules towards and from everyone) as a new
+    /// species. Returns its id.
+    pub fn duplicate_species(&mut self, k: u8) -> Option<u8> {
+        if self.types.len() >= crate::types::MAX_TYPES || k as usize >= self.types.len() {
+            return None;
+        }
+        let mut t = self.types[k as usize].clone();
+        t.custom = true;
+        t.name = format!("{} copy", t.name);
+        t.hue = (t.hue + 40.0) % 360.0;
+        t.color = crate::types::hsv(t.hue, 0.65, 0.95);
+        self.types.push(t);
+        let n = self.types.len();
+        self.rules.resize(n);
+        let new = n - 1;
+        for j in 0..n - 1 {
+            let (a, b) = (self.rules.get(k as usize, j), self.rules.get(j, k as usize));
+            self.rules.set(new, j, a);
+            self.rules.set(j, new, b);
+        }
+        let own = self.rules.get(k as usize, k as usize);
+        self.rules.set(new, new, own);
+        Some(new as u8)
+    }
+
     fn max_radius(&self) -> f32 {
         self.types.iter().map(|t| t.radius).fold(1.0, f32::max)
     }

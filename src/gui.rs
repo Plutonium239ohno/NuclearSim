@@ -1,4 +1,4 @@
-//! A small immediate-mode GUI for the Nuclear Game's panel.
+//! A small immediate-mode GUI for the control panels (sandbox and Nuclear Game).
 //!
 //! Why not megaui: its default font has no arrows, Greek or superscripts
 //! (the event log needs →, γ, ν, α), its sliders are tiny drag handles, and
@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-pub use particle_sim::skin::FONT_BYTES;
+pub use crate::skin::FONT_BYTES;
 
 pub mod col {
     use macroquad::prelude::Color;
@@ -650,6 +650,35 @@ impl Gui {
     /// Is the mouse over r (and inside the current clip)?
     pub fn hover(&self, r: Rect) -> bool {
         self.hovered(&r)
+    }
+
+    /// A custom-drawn clickable area: (clicked, hovered, held). `key` must
+    /// be unique in the current scope. While held, the GUI keeps the mouse.
+    pub fn press(&mut self, key: &str, r: Rect) -> (bool, bool, bool) {
+        if !self.visible(&r) {
+            return (false, false, false);
+        }
+        let id = self.id(key);
+        self.press_box(id, r)
+    }
+
+    /// Was the left button pressed over r this frame?
+    pub fn pressed_in(&self, r: Rect) -> bool {
+        self.pressed && self.hovered(&r)
+    }
+
+    /// Was the right button pressed over r this frame?
+    pub fn right_clicked(&self, r: Rect) -> bool {
+        self.right_pressed && self.hovered(&r)
+    }
+
+    /// Mouse movement since last frame (screen px).
+    pub fn mouse_delta(&self) -> Vec2 {
+        self.mouse - self.last_mouse
+    }
+
+    pub fn shift(&self) -> bool {
+        self.shift
     }
 
     // ------------------------------------------------------------- scrolling

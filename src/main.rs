@@ -331,6 +331,19 @@ async fn main() {
     } else {
         scenes::load_preset(&mut sim, 4);
     }
+    // PARTICLE_SIM_BEAMS=<MeV per nucleon>: two He-4 beams head-on in an
+    // empty box (vacuum).
+    if let Some(e) = std::env::var("PARTICLE_SIM_BEAMS").ok().and_then(|s| s.parse::<f64>().ok()) {
+        sim.clear();
+        sim.walls.clear();
+        sim.nuclear.reset();
+        sim.reactor.clear();
+        sim.cfg = sim.cfg.clone().with_medium(false);
+        let v = sim_core::nuclear::speed_for(&sim.cfg, e * 4.0, 4.0);
+        let (w, h) = (sim.width, sim.height);
+        sim.reactor.spawners.push(Spawner::new(vec2(w * 0.35, h * 0.5), 2, 2, vec2(v, 0.0), 12.0));
+        sim.reactor.spawners.push(Spawner::new(vec2(w * 0.95, h * 0.5), 2, 2, vec2(-v, 0.0), 12.0));
+    }
     // PARTICLE_SIM_OVERLAY=temp|flux|thermal
     g.view.overlay = match std::env::var("PARTICLE_SIM_OVERLAY").as_deref() {
         Ok("temp") => sim_core::overlay::OverlayKind::Temperature,

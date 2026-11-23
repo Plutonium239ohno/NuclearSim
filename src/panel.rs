@@ -7,7 +7,7 @@ use sim_core::game_scenes::{self as scenes, PRESETS, list_scenes, scene_dir};
 use sim_core::nucdata::{self, Mode, format_time, info, nuclide_name, parse_nuclide};
 use sim_core::nuclear::{EventKind, format_energy, sim_half_life, speed_for};
 use sim_core::reactions;
-use sim_core::reactor::SAMPLE_DT;
+use sim_core::reactor::{SAMPLE_DT, Sample};
 use sim_core::reactor::DrainFilter;
 use sim_core::render::ViewMode;
 use sim_core::walls::WallKind;
@@ -45,7 +45,7 @@ pub enum Tab {
 
 const TABS: [(Tab, &str); 6] = [
     (Tab::Build, "Build"),
-    (Tab::Reactor, "Reactor"),
+    (Tab::Reactor, "Reactions"),
     (Tab::View, "View"),
     (Tab::Scenes, "Scenes"),
     (Tab::Physics, "Physics"),
@@ -53,10 +53,11 @@ const TABS: [(Tab, &str); 6] = [
 ];
 
 /// Log filters: (label, kinds shown).
-const FILTERS: [(&str, &[EventKind]); 6] = [
+const FILTERS: [(&str, &[EventKind]); 7] = [
     ("All", &[]),
     ("Fission", &[EventKind::Fission]),
     ("Fusion", &[EventKind::Fusion]),
+    ("Breakup", &[EventKind::Breakup]),
     ("Capture", &[EventKind::Capture]),
     ("Decay", &[EventKind::Decay]),
     ("Other", &[EventKind::Scatter, EventKind::Annihilation, EventKind::Other]),
@@ -72,11 +73,13 @@ pub struct PanelState {
     cache_key: (usize, String),
     seen: u64,
     seed_text: String,
+    /// Graph series shown (see SERIES).
+    series: [bool; SERIES.len()],
 }
 
 impl Default for PanelState {
     fn default() -> Self {
-        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new() }
+        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new(), series: [true, true, true, false, false, true, false] }
     }
 }
 
@@ -188,6 +191,7 @@ fn kind_color(k: EventKind) -> Color {
     match k {
         EventKind::Fission => Color::from_rgba(255, 140, 90, 255),
         EventKind::Fusion => Color::from_rgba(255, 220, 110, 255),
+        EventKind::Breakup => Color::from_rgba(215, 160, 255, 255),
         EventKind::Capture => Color::from_rgba(120, 190, 255, 255),
         EventKind::Scatter => Color::from_rgba(150, 150, 170, 255),
         EventKind::Decay => Color::from_rgba(130, 225, 150, 255),
@@ -272,7 +276,7 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
             ui.scroll_begin(TABS[k].1, body);
             match tab {
                 Tab::Build => build_tab(ui, sim, g),
-                Tab::Reactor => reactor_tab(ui, sim, &mut act),
+                Tab::Reactor => reactor_tab(ui, sim, ps, &mut act),
                 Tab::View => view_tab(ui, g),
                 Tab::Scenes => scenes_tab(ui, g, saved, &mut act),
                 Tab::Physics => {
@@ -523,59 +527,115 @@ fn filter_options(ui: &mut Gui, g: &mut Game) {
     ui.label_col(&format!("This filter {}", describe_filter(w.rule, w.filter_z, w.threshold, w.only)), col::ACCENT);
 }
 
-fn reactor_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
-    if sim.reactor.is_empty() {
-        ui.label("No reactor in this scene.");
-        ui.note("Load one of the reactor scenes, or build your own in the Build tab: fuel channels or spawners, control rods, neutron sources, moderator (Fill with D or C-12), walls, pumps and drains.");
-        if ui.button("Load the heavy-water reactor") {
-            act.preset = Some(3);
-        }
-        if ui.button("Load the molten-salt reactor") {
-            act.preset = Some(scenes::MSR);
-        }
-        if ui.button("Load the nuclear thermal rocket") {
-            act.preset = Some(scenes::ROCKET);
-        }
-        return;
-    }
+fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actions) {
     let re = &sim.reactor;
-    let power = re.power();
-    let period = re.period();
+    let last = |f: &dyn Fn(&Sample) -> f32| -> f32 {
+        let k = re.samples.len().min(8);
+        if k == 0 { 0.0 } else { re.samples.iter().rev().take(k).map(f).sum::<f32>() / k as f32 }
+    };
+    let lastw = |f: &dyn Fn(&Sample) -> f64| -> f64 {
+        let k = re.samples.len().min(8);
+        if k == 0 { 0.0 } else { re.samples.iter().rev().take(k).map(f).sum::<f64>() / k as f64 }
+    };
+    let fission = last(&|s| s.fission_rate);
+    let fusion = last(&|s| s.fusion_rate);
+    let breakup = last(&|s| s.breakup_rate);
+    let capture = last(&|s| s.capture_rate);
+    let decay = last(&|s| s.decay_rate);
+    let (released, absorbed, beam) = (lastw(&|s| s.released_w), lastw(&|s| s.absorbed_w), lastw(&|s| s.beam_w));
+    let net = released - absorbed;
     let neutrons = re.samples.back().map(|s| s.neutrons).unwrap_or(0);
     let recorded = re.recording.len();
-    let (state, sc) = match period {
-        _ if (neutrons == 0 && power == 0.0) || (re.insertion >= 0.99 && !re.rods.is_empty()) => ("SHUT DOWN", col::DIM),
-        Some(p) if p.is_finite() && p > 0.0 && p < 15.0 => ("SUPERCRITICAL", col::BAD),
-        Some(p) if p.is_finite() && p < 0.0 && p > -15.0 => ("SUBCRITICAL", col::ACCENT),
-        Some(_) => ("CRITICAL", col::GOOD),
-        None => ("SOURCE RANGE", col::DIM),
+    let fission_plant = !re.rods.is_empty() || !re.sites.is_empty();
+    let period = re.period();
+
+    // ---- Headline: what kind of nuclear activity, how much power ----
+    let (state, sc) = if fission_plant || fission > 0.05 {
+        match period {
+            _ if (neutrons == 0 && fission == 0.0) || (re.insertion >= 0.99 && !re.rods.is_empty()) => ("FISSION: SHUT DOWN", col::DIM),
+            Some(p) if p.is_finite() && p > 0.0 && p < 15.0 => ("FISSION: SUPERCRITICAL", col::BAD),
+            Some(p) if p.is_finite() && p < 0.0 && p > -15.0 => ("FISSION: SUBCRITICAL", col::ACCENT),
+            Some(_) => ("FISSION: CRITICAL", col::GOOD),
+            None => ("FISSION: SOURCE RANGE", col::DIM),
+        }
+    } else if fusion + breakup > 0.05 {
+        if net > 0.0 { ("FUSION: NET ENERGY OUT", col::GOOD) } else { ("COLLISIONS: NET ENERGY IN", col::WARN) }
+    } else if capture + decay > 0.05 {
+        ("CAPTURES & DECAYS", col::DIM)
+    } else {
+        ("QUIET", col::DIM)
     };
-    // Big readout.
-    let r = ui.alloc(56.0);
+    let r = ui.alloc(78.0);
     draw_rectangle(r.x, r.y, r.w, r.h - 6.0, col::TRACK);
     draw_rectangle_lines(r.x, r.y, r.w, r.h - 6.0, 1.0, col::EDGE);
-    ui.text(state, r.x + 10.0, r.y + 6.0, 20.0, sc);
-    let ptxt = format!("{power:.1} fissions/s");
-    let pw = ui.text_width(&ptxt, 20.0);
-    ui.text(&ptxt, r.x + r.w - pw - 10.0, r.y + 6.0, 20.0, col::TEXT);
-    // ~200 MeV per fission, 1 MeV = 1.602e-13 J.
-    let watts = power as f64 * 200.0 * 1.602e-13;
-    let sub = format!(
-        "{neutrons} free neutrons   period {}   {}",
-        match period {
-            Some(p) if p.is_finite() => format!("{p:+.0} s"),
-            Some(_) => "∞".into(),
-            None => "—".into(),
-        },
-        format_watts(watts)
-    );
+    ui.text(state, r.x + 10.0, r.y + 6.0, 17.0, sc);
+    let ptxt = signed_watts(net);
+    let pw = ui.text_width(&ptxt, 17.0);
+    ui.text(&ptxt, r.x + r.w - pw - 10.0, r.y + 6.0, 17.0, if net >= 0.0 { col::TEXT } else { col::WARN });
+    let sub = format!("released {}   absorbed {}", short_watts(released), short_watts(absorbed));
     ui.text(&sub, r.x + 10.0, r.y + 30.0, 14.0, col::DIM);
+    let third = if beam > 0.0 {
+        format!("beams in {}   gain {}", short_watts(beam), if net > 0.0 { format!("{:.2}", net / beam) } else { "0 (net loss)".into() })
+    } else if fission_plant || fission > 0.05 {
+        format!(
+            "{neutrons} free neutrons   period {}",
+            match period {
+                Some(p) if p.is_finite() => format!("{p:+.0} s"),
+                Some(_) => "∞".into(),
+                None => "—".into(),
+            }
+        )
+    } else {
+        format!("{neutrons} free neutrons")
+    };
+    ui.text(&third, r.x + 10.0, r.y + 49.0, 14.0, col::DIM);
+    ui.tip_if_hover(r, vec![
+        "Reaction power: the Q values of the reactions in the last 2 s, per second.".into(),
+        "Released = exothermic (Q > 0: fission, most fusion, captures).".into(),
+        "Absorbed = endothermic (Q < 0): energy the collision itself paid.".into(),
+        "Beams in = kinetic power put in by spawners. Gain = net ÷ beams in (1 = break-even).".into(),
+        "Decay heat isn't counted. Watts are per second of sim time.".into(),
+    ]);
 
-    plot(ui, sim);
+    // ---- Rates ----
+    let chips: [(&str, String, Color); 6] = [
+        ("fission", rate_text(fission), kind_color(EventKind::Fission)),
+        ("fusion", rate_text(fusion), kind_color(EventKind::Fusion)),
+        ("breakup", rate_text(breakup), kind_color(EventKind::Breakup)),
+        ("capture", rate_text(capture), kind_color(EventKind::Capture)),
+        ("decay", rate_text(decay), kind_color(EventKind::Decay)),
+        ("free n", neutrons.to_string(), NEUTRON_COL),
+    ];
+    let cw = (ui.w - 2.0 * 4.0) / 3.0;
+    let row = ui.alloc(2.0 * 38.0 + 4.0);
+    for (k, (name, val, c)) in chips.iter().enumerate() {
+        let (cx, cy) = (row.x + (k % 3) as f32 * (cw + 4.0), row.y + (k / 3) as f32 * 40.0);
+        draw_rectangle(cx, cy, cw, 36.0, col::WIDGET);
+        draw_rectangle(cx, cy, 3.0, 36.0, *c);
+        ui.text(name, cx + 9.0, cy + 3.0, 12.0, col::DIM);
+        ui.text(val, cx + 9.0, cy + 16.0, 16.0, col::TEXT);
+    }
+    ui.space(4.0);
+    ui.note("Per second of sim time, last 2 s. Fusion: nuclei merge into something heavier than either. Breakup: nothing heavier comes out (knock-out, charge exchange, spallation).");
+
+    plot(ui, sim, ps);
     if ui.button(&format!("Export graphs (CSV, {:.0} s recorded)", recorded as f32 * SAMPLE_DT)) {
         act.export_graphs = true;
     }
-    ui.note("Every sample since the scene was loaded: time, free neutrons, fissions/s, thermal power, rod position, mean temperature, hottest wall. Saved next to the scenes folder (logs).");
+
+    busiest(ui, sim);
+
+    if !fission_plant && sim.reactor.is_empty() && fission + fusion + breakup + capture + decay == 0.0 {
+        ui.heading("Get something going");
+        ui.note("Launch nuclei at each other (drag with the Nucleus tool, or point two Spawners at each other), or load a reactor.");
+        match ui.buttons(&["Heavy-water reactor", "Molten-salt reactor", "Rocket"]) {
+            Some(0) => act.preset = Some(3),
+            Some(1) => act.preset = Some(scenes::MSR),
+            Some(2) => act.preset = Some(scenes::ROCKET),
+            _ => {}
+        }
+        return;
+    }
 
     if !sim.reactor.rods.is_empty() {
         ui.heading("Control rods  [↑ / ↓,  X = SCRAM]");
@@ -711,56 +771,177 @@ fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
 }
 
 /// Neutron count, fission rate and rod position over the recorded history.
-fn plot(ui: &mut Gui, sim: &Sim) {
-    let r = ui.alloc(128.0);
-    let r = Rect::new(r.x, r.y + 4.0, r.w, r.h - 18.0);
+const NEUTRON_COL: Color = Color { r: 0.75, g: 0.78, b: 0.86, a: 1.0 };
+const POWER_COL: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+
+/// Graph series: name, colour, value of a sample.
+const SERIES: [(&str, fn() -> Color, fn(&Sample) -> f32); 7] = [
+    ("fission", || kind_color(EventKind::Fission), |s| s.fission_rate),
+    ("fusion", || kind_color(EventKind::Fusion), |s| s.fusion_rate),
+    ("breakup", || kind_color(EventKind::Breakup), |s| s.breakup_rate),
+    ("capture", || kind_color(EventKind::Capture), |s| s.capture_rate),
+    ("decay", || kind_color(EventKind::Decay), |s| s.decay_rate),
+    ("neutrons", || NEUTRON_COL, |s| s.neutrons as f32),
+    ("power", || POWER_COL, |s| s.net_w() as f32),
+];
+
+/// The last two minutes: each shown series on its own scale (its maximum
+/// is written on its toggle). Rods, if any, as a band from the top.
+fn plot(ui: &mut Gui, sim: &Sim, ps: &mut PanelState) {
+    // Toggles.
+    let cols = 4;
+    let gap = 3.0;
+    let bw = (ui.w - gap * (cols as f32 - 1.0)) / cols as f32;
+    let s = &sim.reactor.samples;
+    let n_show = ((120.0 / SAMPLE_DT) as usize).min(s.len());
+    let pts: Vec<&Sample> = s.iter().skip(s.len() - n_show).collect();
+    let maxes: Vec<f32> = SERIES.iter().map(|(_, _, f)| pts.iter().map(|p| f(p).abs()).fold(0.0, f32::max)).collect();
+    let rows = SERIES.len().div_ceil(cols);
+    let area = ui.alloc(rows as f32 * 24.0);
+    for (k, (name, c, _)) in SERIES.iter().enumerate() {
+        let b = Rect::new(area.x + (k % cols) as f32 * (bw + gap), area.y + (k / cols) as f32 * 24.0, bw, 21.0);
+        let (clicked, hov, _) = ui.press(&format!("series{k}"), b);
+        if clicked {
+            ps.series[k] = !ps.series[k];
+        }
+        let on = ps.series[k];
+        draw_rectangle(b.x, b.y, b.w, b.h, if hov { col::HOVER } else { col::WIDGET });
+        let c = c();
+        draw_rectangle(b.x + 5.0, b.y + 7.0, 8.0, 8.0, if on { c } else { Color::new(c.r, c.g, c.b, 0.25) });
+        let m = if *name == "power" { short_watts(maxes[k] as f64) } else if maxes[k] >= 10.0 { format!("{:.0}", maxes[k]) } else { format!("{:.1}", maxes[k]) };
+        let label = format!("{name} {m}");
+        let (t, _) = ui.fit(&label, b.w - 20.0, 12.0);
+        ui.text(&t, b.x + 17.0, b.y + 3.0, 12.0, if on { col::TEXT } else { col::FAINT });
+    }
+    let r = ui.alloc(118.0);
+    let r = Rect::new(r.x, r.y + 2.0, r.w, r.h - 18.0);
     draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.05, 0.055, 0.075, 1.0));
     draw_rectangle_lines(r.x, r.y, r.w, r.h, 1.0, col::EDGE);
-    let s = &sim.reactor.samples;
-    if s.len() < 2 {
+    if pts.len() < 2 {
         return;
     }
-    // Show the whole history up to 2 minutes, filling the width.
-    let n_show = ((120.0 / SAMPLE_DT) as usize).min(s.len());
-    let pts: Vec<_> = s.iter().skip(s.len() - n_show).collect();
-    let nmax = pts.iter().map(|p| p.neutrons as f32).fold(10.0, f32::max) * 1.15;
-    let fmax = pts.iter().map(|p| p.fission_rate).fold(4.0, f32::max) * 1.15;
     let slots = (n_show.max(40) - 1) as f32;
     let xs = |k: usize| r.x + r.w * k as f32 / slots;
-    // Rod insertion: a shaded band from the top, one rect per level.
-    let mut k0 = 0;
-    for k in 1..=pts.len() {
-        if k == pts.len() || (pts[k].insertion - pts[k0].insertion).abs() > 0.004 {
-            let (x0, x1) = (xs(k0).floor(), xs(k.min(pts.len() - 1)).floor());
-            let bh = r.h * pts[k0].insertion;
-            draw_rectangle(x0, r.y, (x1 - x0).max(1.0), bh, Color::new(0.42, 0.45, 0.56, 0.32));
-            draw_line(x0, r.y + bh, x1.max(x0 + 1.0), r.y + bh, 1.0, Color::new(0.62, 0.65, 0.76, 0.9));
-            k0 = k;
+    if !sim.reactor.rods.is_empty() {
+        let mut k0 = 0;
+        for k in 1..=pts.len() {
+            if k == pts.len() || (pts[k].insertion - pts[k0].insertion).abs() > 0.004 {
+                let (x0, x1) = (xs(k0).floor(), xs(k.min(pts.len() - 1)).floor());
+                let bh = r.h * pts[k0].insertion;
+                draw_rectangle(x0, r.y, (x1 - x0).max(1.0), bh, Color::new(0.42, 0.45, 0.56, 0.32));
+                draw_line(x0, r.y + bh, x1.max(x0 + 1.0), r.y + bh, 1.0, Color::new(0.62, 0.65, 0.76, 0.9));
+                k0 = k;
+            }
         }
     }
-    let mut smooth = 0.0;
-    let mut prev_f: Option<Vec2> = None;
-    let mut prev_n: Option<Vec2> = None;
-    for (k, p) in pts.iter().enumerate() {
-        smooth = if k == 0 { p.fission_rate } else { smooth * 0.75 + p.fission_rate * 0.25 };
-        let x = xs(k);
-        let pf = vec2(x, r.y + r.h - r.h * smooth / fmax);
-        let pn = vec2(x, r.y + r.h - r.h * p.neutrons as f32 / nmax);
-        if let Some(a) = prev_f {
-            draw_line(a.x, a.y, pf.x, pf.y, 1.5, Color::from_rgba(255, 140, 90, 255));
+    // Net power can go negative: its zero line sits mid-height when it does.
+    for (k, (name, c, f)) in SERIES.iter().enumerate() {
+        if !ps.series[k] || maxes[k] <= 0.0 {
+            continue;
         }
-        if let Some(a) = prev_n {
-            draw_line(a.x, a.y, pn.x, pn.y, 1.5, Color::from_rgba(120, 190, 255, 255));
+        let signed = *name == "power" && pts.iter().any(|p| f(p) < 0.0);
+        let top = maxes[k] * 1.15;
+        let y_of = |v: f32| if signed { r.y + r.h * 0.5 - r.h * 0.5 * v / top } else { r.y + r.h - r.h * v / top };
+        if signed {
+            draw_line(r.x, r.y + r.h * 0.5, r.x + r.w, r.y + r.h * 0.5, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
         }
-        prev_f = Some(pf);
-        prev_n = Some(pn);
+        let mut smooth = 0.0;
+        let mut prev: Option<Vec2> = None;
+        for (i, p) in pts.iter().enumerate() {
+            let v = f(p);
+            smooth = if i == 0 { v } else { smooth * 0.7 + v * 0.3 };
+            let q = vec2(xs(i), y_of(smooth));
+            if let Some(a) = prev {
+                draw_line(a.x, a.y, q.x, q.y, 1.5, c());
+            }
+            prev = Some(q);
+        }
     }
-    ui.text(&format!("neutrons (max {:.0})", nmax / 1.15), r.x + 6.0, r.y + 3.0, 13.0, Color::from_rgba(120, 190, 255, 255));
-    let t = format!("fissions/s (max {:.1})", fmax / 1.15);
-    let tw = ui.text_width(&t, 13.0);
-    ui.text(&t, r.x + r.w - tw - 6.0, r.y + 3.0, 13.0, Color::from_rgba(255, 140, 90, 255));
     let secs = n_show as f32 * SAMPLE_DT;
-    ui.text(&format!("last {secs:.0} s   grey band from the top = rod insertion"), r.x, r.y + r.h + 2.0, 12.0, col::FAINT);
+    let note = if sim.reactor.rods.is_empty() { format!("last {secs:.0} s   each line on its own scale") } else { format!("last {secs:.0} s   own scales   grey band = rod insertion") };
+    ui.text(&note, r.x, r.y + r.h + 2.0, 12.0, col::FAINT);
+}
+
+/// The most frequent reactions of the last 10 s, and a warning when the
+/// collisions are beyond what the reaction model is good for.
+fn busiest(ui: &mut Gui, sim: &Sim) {
+    let st = &sim.nuclear;
+    let since = st.time - 10.0;
+    let mut by: Vec<(String, EventKind, f64, u32)> = Vec::new();
+    let mut per_nucleon: Vec<f64> = Vec::new();
+    for ev in st.history.iter().rev().take_while(|e| e.t >= since) {
+        if !matches!(ev.kind, EventKind::Fission | EventKind::Fusion | EventKind::Breakup | EventKind::Capture) {
+            continue;
+        }
+        let eq = ev.equation().to_string();
+        if let (Some(e), Some((lhs, _))) = (ev.energy(), eq.split_once(" → ")) {
+            let a: u32 = lhs.split(" + ").map(mass_number).sum();
+            if a > 1 {
+                per_nucleon.push(e / a as f64);
+            }
+        }
+        match by.iter_mut().find(|x| x.0 == eq) {
+            Some(x) => x.3 += 1,
+            None => by.push((eq, ev.kind, ev.q().unwrap_or(0.0), 1)),
+        }
+    }
+    if by.is_empty() {
+        return;
+    }
+    by.sort_by(|a, b| b.3.cmp(&a.3));
+    ui.heading("Busiest reactions  (last 10 s)");
+    for (eq, kind, q, n) in by.iter().take(7) {
+        let r = ui.alloc(20.0);
+        let c = kind_color(*kind);
+        ui.text(&format!("{n}×"), r.x, r.y + 2.0, 13.0, col::DIM);
+        let qt = format!("Q {q:+.1} MeV");
+        let qw = ui.text_width(&qt, 12.0);
+        let (t, _) = ui.fit(eq, r.w - 40.0 - qw - 8.0, 13.0);
+        ui.text(&t, r.x + 34.0, r.y + 2.0, 13.0, c);
+        ui.text(&qt, r.x + r.w - qw, r.y + 3.0, 12.0, if *q >= 0.0 { col::GOOD } else { col::WARN });
+    }
+    if !per_nucleon.is_empty() {
+        per_nucleon.sort_by(|a, b| a.total_cmp(b));
+        let med = per_nucleon[per_nucleon.len() / 2];
+        ui.note(&format!("Median collision energy: {} per nucleon (centre of mass).", format_energy(med)));
+        if med > 10.0 {
+            ui.label_sized(
+                "Above ~10 MeV per nucleon real collisions shatter nuclei (spallation, many fragments; pions above ~300 MeV, relativity above ~100 MeV). This sim treats them as a compound nucleus with non-relativistic energies, so read these reactions as indicative only.",
+                ui.size - 2.5,
+                col::WARN,
+            );
+        }
+    }
+}
+
+/// "He-3" -> 3, "n"/"p" -> 1, "2n" -> 2.
+fn mass_number(name: &str) -> u32 {
+    if let Some((_, a)) = name.trim().rsplit_once('-') {
+        return a.parse().unwrap_or(0);
+    }
+    let name = name.trim();
+    let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let k: u32 = digits.parse().unwrap_or(1);
+    if matches!(&name[digits.len()..], "n" | "p") { k } else { 0 }
+}
+
+fn rate_text(r: f32) -> String {
+    if r == 0.0 {
+        "0".into()
+    } else if r < 10.0 {
+        format!("{r:.1}/s")
+    } else {
+        format!("{r:.0}/s")
+    }
+}
+
+/// "3.2 pW" (absolute value).
+fn short_watts(w: f64) -> String {
+    format_watts(w.abs()).trim_end_matches(" thermal").to_string()
+}
+
+fn signed_watts(w: f64) -> String {
+    if w == 0.0 { "0 W".into() } else { format!("{}{}", if w < 0.0 { "−" } else { "+" }, short_watts(w)) }
 }
 
 fn view_tab(ui: &mut Gui, g: &mut Game) {

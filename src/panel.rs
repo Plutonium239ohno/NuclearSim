@@ -37,20 +37,28 @@ pub struct Actions {
 pub enum Tab {
     Build,
     Reactor,
+    Measure,
+    Auto,
+    Isotopes,
     View,
     Scenes,
     Physics,
     Log,
 }
 
-const TABS: [(Tab, &str); 6] = [
+/// Two rows of tabs.
+const TABS: [(Tab, &str); 9] = [
     (Tab::Build, "Build"),
     (Tab::Reactor, "Reactions"),
+    (Tab::Measure, "Measure"),
+    (Tab::Auto, "Auto"),
+    (Tab::Isotopes, "Isotopes"),
     (Tab::View, "View"),
     (Tab::Scenes, "Scenes"),
     (Tab::Physics, "Physics"),
     (Tab::Log, "Log"),
 ];
+const FIRST_ROW: usize = 5;
 
 /// Log filters: (label, kinds shown).
 const FILTERS: [(&str, &[EventKind]); 7] = [
@@ -75,11 +83,15 @@ pub struct PanelState {
     seed_text: String,
     /// Graph series shown (see SERIES).
     series: [bool; SERIES.len()],
+    /// Spawner whose editor is open on the Reactions tab.
+    pub open_spawner: Option<usize>,
+    pub rule: crate::tabs::RuleBuilder,
+    pub chart: crate::tabs::Chart,
 }
 
 impl Default for PanelState {
     fn default() -> Self {
-        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new(), series: [true, true, true, false, false, true, false] }
+        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new(), series: [true, true, true, false, false, true, false, false], open_spawner: None, rule: Default::default(), chart: Default::default() }
     }
 }
 
@@ -134,7 +146,7 @@ pub fn describe(z: u32, n: u32, cfg: &Config) -> Vec<String> {
         Some(t) if t < 1e-12 => out.push(format!("unbound: falls apart at once ({})", format_time(t))),
         Some(t) => out.push(format!("half-life {}   (here: {})", format_time(t), format_time(sim_half_life(t, cfg)))),
     }
-    if !nuc.branches.is_empty() {
+    if !nuc.branches.is_empty() && nuc.half_life.is_some() {
         let mut parts: Vec<String> = nuc
             .branches
             .iter()
@@ -187,7 +199,7 @@ fn barns(b: f64) -> String {
     }
 }
 
-fn kind_color(k: EventKind) -> Color {
+pub(crate) fn kind_color(k: EventKind) -> Color {
     match k {
         EventKind::Fission => Color::from_rgba(255, 140, 90, 255),
         EventKind::Fusion => Color::from_rgba(255, 220, 110, 255),
@@ -265,7 +277,15 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
     let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
     let mut k = TABS.iter().position(|t| t.0 == ps.tab).unwrap_or(0);
     ui.scope("tabs");
-    ui.tabs(&refs, &mut k);
+    let mut a = if k < FIRST_ROW { k } else { usize::MAX };
+    if ui.tabs(&refs[..FIRST_ROW], &mut a) {
+        k = a;
+    }
+    ui.space(-4.0);
+    let mut b = if k >= FIRST_ROW { k - FIRST_ROW } else { usize::MAX };
+    if ui.tabs(&refs[FIRST_ROW..], &mut b) {
+        k = b + FIRST_ROW;
+    }
     ps.tab = TABS[k].0;
     ui.space(4.0);
     let body = Rect::new(pad, ui.y, w - pad - 4.0, h - ui.y - 6.0);
@@ -277,6 +297,9 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
             match tab {
                 Tab::Build => build_tab(ui, sim, g),
                 Tab::Reactor => reactor_tab(ui, sim, ps, &mut act),
+                Tab::Measure => crate::tabs::measure_tab(ui, sim, g),
+                Tab::Auto => crate::tabs::auto_tab(ui, sim, ps),
+                Tab::Isotopes => crate::tabs::isotopes_tab(ui, sim, g, ps),
                 Tab::View => view_tab(ui, g),
                 Tab::Scenes => scenes_tab(ui, g, saved, &mut act),
                 Tab::Physics => {
@@ -311,10 +334,11 @@ fn compact(n: u64) -> String {
 
 fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
     ui.heading("Tools  [1-9]");
-    let groups: [(&str, &[(Tool, &str)]); 3] = [
+    let groups: [(&str, &[(Tool, &str)]); 4] = [
         ("Matter", &[(Tool::Nucleus, "Nucleus  1"), (Tool::Fill, "Fill area  4"), (Tool::Erase, "Erase  2"), (Tool::Electron, "Electron"), (Tool::Positron, "Positron"), (Tool::Spawner, "Spawner  8")]),
-        ("Structure", &[(Tool::Wall, "Wall  3"), (Tool::EraseWall, "Erase wall"), (Tool::Pump, "Pump"), (Tool::Drain, "Drain  9"), (Tool::Force, "Push / pull  F")]),
-        ("Reactor", &[(Tool::Rod, "Control rod  5"), (Tool::FuelChannel, "Fuel channel  6"), (Tool::Source, "n source  7")]),
+        ("Structure", &[(Tool::Wall, "Wall  3"), (Tool::EraseWall, "Erase wall"), (Tool::Pump, "Pump"), (Tool::Drain, "Drain  9"), (Tool::Field, "E/B field  M"), (Tool::Force, "Push / pull  F")]),
+        ("Fission reactor", &[(Tool::Rod, "Control rod  5"), (Tool::FuelChannel, "Fuel channel  6"), (Tool::Source, "n source  7")]),
+        ("Measure", &[(Tool::Inspect, "Inspect  I"), (Tool::Detector, "Detector  K")]),
     ];
     for (title, tools) in groups {
         ui.note(title);
@@ -334,7 +358,10 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
         Tool::FuelChannel => "Click to load the nuclide below and register a fuel channel the fuelling machine keeps loaded.",
         Tool::Source => "Click to add an Am-Be startup neutron source (as many as you like).",
         Tool::Fill => "Drag a rectangle to fill it with the nuclide below: moderator, fuel salt, propellant.",
-        Tool::Spawner => "Click (or drag to aim) to add a spawner for the nuclide below: a fuel line, propellant feed or neutron gun.",
+        Tool::Spawner => "Click (or drag to aim) to add a spawner for the nuclide below: a fuel line, propellant feed or neutron gun - or, in beam mode, an accelerator beam at a set energy (fusion targets, colliding beams, spallation).",
+        Tool::Inspect => "Click a nucleus: its properties, the reaction or decay that made it and what it becomes (Measure tab).",
+        Tool::Detector => "Drag a box (counts what enters it or is made in it) or a line (counts what crosses it). Readings and spectra on the Measure tab.",
+        Tool::Field => "Drag a rectangle: a region of electric and/or magnetic field that steers charged particles (beams, plasma traps). Edit it on the Measure tab.",
         Tool::Drain => "Drag a rectangle: matter entering it is removed and measured (exhaust nozzle, drain tank, off-gas).",
         Tool::Pump => "Drag a rectangle along the flow: it pushes matter (not neutrons) that way. Loops make a molten-salt circuit.",
         Tool::Force => "Hold the left button to pull matter towards the mouse, Shift to push it away. The right button does the same with any tool.",
@@ -371,8 +398,30 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
             thickness_slider(ui, g);
             ui.note("Settings apply to the walls you draw next; walls already drawn keep theirs (hover one to see them).");
         }
-        Tool::Spawner => {
-            ui.slider("Spawn rate", &mut g.spawn_rate, 0.1, 30.0, Scale::Log, 2.0, |v| format!("{v:.1}/s"));
+        Tool::Spawner => crate::tabs::new_spawner_options(ui, sim, g),
+        Tool::Detector => {
+            let mut k = g.det_line as usize;
+            if ui.segmented(&["Box", "Line"], &mut k, 2) {
+                g.det_line = k == 1;
+            }
+            ui.segmented(&sim_core::detector::DetectFilter::NAMES, &mut g.det_filter, 4);
+            if g.det_filter >= 5 {
+                ui.note(&format!("Uses the loader below: {}", if g.det_filter == 5 { nucdata::SYMBOLS.get(g.z as usize).copied().unwrap_or("n").to_string() } else { nuclide_name(g.z, g.n) }));
+            }
+            ui.checkbox("Count photons and neutrinos too", &mut g.det_light);
+        }
+        Tool::Field => {
+            ui.slider("Magnetic: proton turn rate", &mut g.field_b, -10.0, 10.0, Scale::Lin, 2.0, |v| {
+                if v == 0.0 { "off".into() } else { format!("{:.2} rad/s {}", v.abs(), if v > 0.0 { "↺" } else { "↻" }) }
+            });
+            ui.slider("Electric: push on a proton", &mut g.field_e, 0.0, 3000.0, Scale::Lin, 0.0, |v| if v == 0.0 { "off".into() } else { format!("{v:.0} px/s²") });
+            if g.field_e > 0.0 {
+                let mut k = g.field_dir;
+                if ui.segmented(&["→", "↓", "←", "↑"], &mut k, 4) {
+                    g.field_dir = k;
+                }
+            }
+            ui.note("B bends charges into circles (positive: protons turn anticlockwise); E pushes positive charges along it, negative ones against it. Neutrons ignore both.");
         }
         Tool::Drain => {
             let names: Vec<&str> = DrainFilter::ALL.iter().map(|f| f.name()).collect();
@@ -543,6 +592,7 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
     let capture = last(&|s| s.capture_rate);
     let decay = last(&|s| s.decay_rate);
     let (released, absorbed, beam) = (lastw(&|s| s.released_w), lastw(&|s| s.absorbed_w), lastw(&|s| s.beam_w));
+    let decay_w = lastw(&|s| s.decay_w);
     let net = released - absorbed;
     let neutrons = re.samples.back().map(|s| s.neutrons).unwrap_or(0);
     let recorded = re.recording.len();
@@ -588,13 +638,16 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
     } else {
         format!("{neutrons} free neutrons")
     };
+    let third = if decay_w > 0.0 { format!("{third}   decay heat {}", short_watts(decay_w)) } else { third };
+    let (third, _) = ui.fit(&third, r.w - 20.0, 14.0);
     ui.text(&third, r.x + 10.0, r.y + 49.0, 14.0, col::DIM);
     ui.tip_if_hover(r, vec![
         "Reaction power: the Q values of the reactions in the last 2 s, per second.".into(),
         "Released = exothermic (Q > 0: fission, most fusion, captures).".into(),
         "Absorbed = endothermic (Q < 0): energy the collision itself paid.".into(),
         "Beams in = kinetic power put in by spawners. Gain = net ÷ beams in (1 = break-even).".into(),
-        "Decay heat isn't counted. Watts are per second of sim time.".into(),
+        "Decay heat (radioactive decays, neutrinos excluded) is shown on its own: it keeps going after a SCRAM.".into(),
+        "Watts are per second of sim time.".into(),
     ]);
 
     // ---- Rates ----
@@ -624,14 +677,24 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
     }
 
     busiest(ui, sim);
+    crate::tabs::inventory_section(ui, sim);
 
     if !fission_plant && sim.reactor.is_empty() && fission + fusion + breakup + capture + decay == 0.0 {
         ui.heading("Get something going");
         ui.note("Launch nuclei at each other (drag with the Nucleus tool, or point two Spawners at each other), or load a reactor.");
+        ui.note("Fission:");
         match ui.buttons(&["Heavy-water reactor", "Molten-salt reactor", "Rocket"]) {
             Some(0) => act.preset = Some(3),
             Some(1) => act.preset = Some(scenes::MSR),
             Some(2) => act.preset = Some(scenes::ROCKET),
+            _ => {}
+        }
+        ui.note("Fusion and beams:");
+        match ui.buttons(&["D-T plasma", "Magnetic bottle", "Neutron generator", "Collider"]) {
+            Some(0) => act.preset = Some(1),
+            Some(1) => act.preset = Some(scenes::BOTTLE),
+            Some(2) => act.preset = Some(scenes::GENERATOR),
+            Some(3) => act.preset = Some(scenes::COLLIDER),
             _ => {}
         }
         return;
@@ -689,21 +752,30 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
         }
     }
     let re = &mut sim.reactor;
-    ui.heading("Neutron sources");
-    if re.sources.is_empty() {
-        ui.note("None: place Am-Be sources with the n source tool (Build tab). A shut-down core has no neutrons of its own.");
-    } else {
-        ui.slider(&format!("Strength of each of {} sources", re.sources.len()), &mut re.source_rate, 0.0, 5.0, Scale::Lin, 0.5, |v| format!("{v:.2} n/s"));
+    if fission_plant || !re.sources.is_empty() {
+        ui.heading("Neutron sources");
+        if re.sources.is_empty() {
+            ui.note("None: place Am-Be sources with the n source tool (Build tab). A shut-down core has no neutrons of its own.");
+        } else {
+            ui.slider(&format!("Strength of each of {} sources", re.sources.len()), &mut re.source_rate, 0.0, 5.0, Scale::Lin, 0.5, |v| format!("{v:.2} n/s"));
+        }
     }
+    crate::tabs::spawners_section(ui, sim, ps);
     flow_tab(ui, sim);
     ui.heading("How to run it");
     let re = &sim.reactor;
-    if re.spawners.iter().any(|s| s.keep > 0) {
+    if !fission_plant && re.spawners.iter().any(|s| s.beam) {
+        ui.note("Beams: pick the energy per nucleon to pick the physics. Up to a few MeV/u, light nuclei tunnel and fuse (D + T, p + B-11) and the gain readout says whether you get out more than the beam put in. From ~15 MeV/u collisions start to shatter nuclei, and above ~80 MeV/u they all do: watch the Log fill with fragmentation. Detectors (Measure tab) count what comes out; the Auto tab can throttle the beams to hold a rate.");
+    } else if !fission_plant && fusion > 0.0 {
+        ui.note("Plasma: fusion comes from the fast tail of the thermal motion tunnelling through the Coulomb barrier. Hotter plasma fuses more; D-T lights at the lowest temperature, then D-D, D-He-3, and p-B-11 needs the most. A magnetic field (Field tool, M) keeps the ions in while the fusion neutrons fly out.");
+    } else if re.spawners.iter().any(|s| s.keep > 0) {
         ui.note("Molten salt: the fuel is in the salt, and its concentration (the fuel feed above) sets the power more than the rods do - the salt moderates poorly, so most fissions happen at keV energies where boron is nearly transparent. The salt's heat leaves through the conductor wall into the helium stream. The freeze plug in the floor is the safety: run it flat out (rods out, lots of fuel) for a couple of minutes and the salt gets hot enough to melt it; the salt drains into the tank below and the chain reaction stops. Its melt point is in the Physics tab.");
     } else if re.drains.iter().any(|d| d.filter == sim_core::reactor::DrainFilter::All) && re.spawners.iter().any(|s| s.z + s.n <= 2) {
         ui.note("Rocket: withdraw the rods to heat the core. Fission heat warms the moderator; the moderator heats the conductor plate; the hydrogen pumped under the plate picks the heat up and leaves through the nozzle. The exhaust reading under Drains is your exhaust speed and thrust - more power, hotter plate, faster exhaust.");
+    } else if fission_plant {
+        ui.note("Withdraw the rods until the period turns positive and power climbs, then insert them a little to hold it level (or let the controller on the Auto tab do it). Delayed neutrons from fission products (Br-87, I-137) are what make this possible: watch the period, not the instantaneous count. Xe-135 builds up after a run at power and soaks up neutrons. After a SCRAM the decay heat keeps coming.");
     } else {
-        ui.note("Withdraw the rods until the period turns positive and power climbs, then insert them a little to hold it level. Delayed neutrons from fission products (Br-87, I-137) are what make this possible: watch the period, not the instantaneous count. Xe-135 builds up after a run at power and soaks up neutrons.");
+        ui.note("Launch nuclei at each other, fill a box with hot plasma, or set up a beam (Spawner tool in beam mode). The Measure tab has detectors and an inspector; the Auto tab can run things for you.");
     }
 }
 
@@ -713,26 +785,6 @@ fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
     use sim_core::walls::WallKind;
     let cfg = sim.cfg.clone();
     let re = &mut sim.reactor;
-    if !re.spawners.is_empty() {
-        ui.heading("Spawners");
-        for (k, sp) in re.spawners.iter_mut().enumerate() {
-            if sp.keep > 0 {
-                let mut keep = sp.keep as f32;
-                let name = format!("{} concentration: keep in the salt  ({} added)", nuclide_name(sp.z, sp.n), sp.spawned);
-                if ui.slider(&format!("{name}##keep{k}"), &mut keep, 1.0, 40.0, Scale::Lin, 24.0, |v| format!("{:.0}", v.round())) {
-                    sp.keep = keep.round() as u32;
-                }
-            } else {
-                let name = format!("{} → {:.0} px/s   ({} made)", nuclide_name(sp.z, sp.n), sp.vel.length(), sp.spawned);
-                ui.slider(&format!("{name}##sp{k}"), &mut sp.rate, 0.0, 30.0, Scale::Lin, 2.0, |v| format!("{v:.1}/s"));
-            }
-        }
-        match ui.buttons(&["Pause all", "Remove all"]) {
-            Some(0) => re.spawners.iter_mut().for_each(|sp| sp.rate = 0.0),
-            Some(1) => re.spawners.clear(),
-            _ => {}
-        }
-    }
     if !re.drains.is_empty() {
         ui.heading("Drains & exhausts");
         for d in &re.drains {
@@ -774,8 +826,10 @@ fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
 const NEUTRON_COL: Color = Color { r: 0.75, g: 0.78, b: 0.86, a: 1.0 };
 const POWER_COL: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 
+const DECAY_COL: Color = Color { r: 1.0, g: 0.55, b: 0.75, a: 1.0 };
+
 /// Graph series: name, colour, value of a sample.
-const SERIES: [(&str, fn() -> Color, fn(&Sample) -> f32); 7] = [
+const SERIES: [(&str, fn() -> Color, fn(&Sample) -> f32); 8] = [
     ("fission", || kind_color(EventKind::Fission), |s| s.fission_rate),
     ("fusion", || kind_color(EventKind::Fusion), |s| s.fusion_rate),
     ("breakup", || kind_color(EventKind::Breakup), |s| s.breakup_rate),
@@ -783,6 +837,7 @@ const SERIES: [(&str, fn() -> Color, fn(&Sample) -> f32); 7] = [
     ("decay", || kind_color(EventKind::Decay), |s| s.decay_rate),
     ("neutrons", || NEUTRON_COL, |s| s.neutrons as f32),
     ("power", || POWER_COL, |s| s.net_w() as f32),
+    ("decay heat", || DECAY_COL, |s| s.decay_w as f32),
 ];
 
 /// The last two minutes: each shown series on its own scale (its maximum
@@ -808,7 +863,7 @@ fn plot(ui: &mut Gui, sim: &Sim, ps: &mut PanelState) {
         draw_rectangle(b.x, b.y, b.w, b.h, if hov { col::HOVER } else { col::WIDGET });
         let c = c();
         draw_rectangle(b.x + 5.0, b.y + 7.0, 8.0, 8.0, if on { c } else { Color::new(c.r, c.g, c.b, 0.25) });
-        let m = if *name == "power" { short_watts(maxes[k] as f64) } else if maxes[k] >= 10.0 { format!("{:.0}", maxes[k]) } else { format!("{:.1}", maxes[k]) };
+        let m = if *name == "power" || *name == "decay heat" { short_watts(maxes[k] as f64) } else if maxes[k] >= 10.0 { format!("{:.0}", maxes[k]) } else { format!("{:.1}", maxes[k]) };
         let label = format!("{name} {m}");
         let (t, _) = ui.fit(&label, b.w - 20.0, 12.0);
         ui.text(&t, b.x + 17.0, b.y + 3.0, 12.0, if on { col::TEXT } else { col::FAINT });
@@ -875,9 +930,11 @@ fn busiest(ui: &mut Gui, sim: &Sim) {
         }
         let eq = ev.equation().to_string();
         if let (Some(e), Some((lhs, _))) = (ev.energy(), eq.split_once(" → ")) {
-            let a: u32 = lhs.split(" + ").map(mass_number).sum();
-            if a > 1 {
-                per_nucleon.push(e / a as f64);
+            // Beam-on-target energy per nucleon: E_cm / reduced mass.
+            let m: Vec<u32> = lhs.split(" + ").map(mass_number).collect();
+            if m.len() == 2 && m[0] > 0 && m[1] > 0 {
+                let mu = (m[0] * m[1]) as f64 / (m[0] + m[1]) as f64;
+                per_nucleon.push(e / mu);
             }
         }
         match by.iter_mut().find(|x| x.0 == eq) {
@@ -903,13 +960,11 @@ fn busiest(ui: &mut Gui, sim: &Sim) {
     if !per_nucleon.is_empty() {
         per_nucleon.sort_by(|a, b| a.total_cmp(b));
         let med = per_nucleon[per_nucleon.len() / 2];
-        ui.note(&format!("Median collision energy: {} per nucleon (centre of mass).", format_energy(med)));
-        if med > 10.0 {
-            ui.label_sized(
-                "Above ~10 MeV per nucleon real collisions shatter nuclei (spallation, many fragments; pions above ~300 MeV, relativity above ~100 MeV). This sim treats them as a compound nucleus with non-relativistic energies, so read these reactions as indicative only.",
-                ui.size - 2.5,
-                col::WARN,
-            );
+        ui.note(&format!("Median collision energy: {}/u (as a beam on a target at rest).", format_energy(med)));
+        let (what, c) = crate::tabs::regime(med);
+        ui.label_sized(&format!("Regime: {what}"), ui.size - 2.0, c);
+        if med >= sim_core::nuclear::FRAG_START {
+            ui.note("Fast collisions shatter nuclei here (fragmentation): where they overlap, nucleons and light clusters fly out; the rest of each nucleus carries on, hot, and boils off neutrons. Above ~300 MeV/u real collisions make pions and need relativity - beyond this model.");
         }
     }
 }

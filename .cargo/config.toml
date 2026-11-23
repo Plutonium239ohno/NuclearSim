@@ -1,0 +1,3 @@
+[build]
+# Let LLVM use AVX2/etc. on this machine for the SIMD-friendly force loops.
+rustflags = ["-C", "target-cpu=native"]

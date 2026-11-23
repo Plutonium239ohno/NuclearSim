@@ -296,7 +296,7 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
             ui.scroll_begin(TABS[k].1, body);
             match tab {
                 Tab::Build => build_tab(ui, sim, g),
-                Tab::Reactor => reactor_tab(ui, sim, ps, &mut act),
+                Tab::Reactor => reactor_tab(ui, sim, ps, &mut act, (g.z, g.n)),
                 Tab::Measure => crate::tabs::measure_tab(ui, sim, g),
                 Tab::Auto => crate::tabs::auto_tab(ui, sim, ps),
                 Tab::Isotopes => crate::tabs::isotopes_tab(ui, sim, g, ps),
@@ -576,7 +576,7 @@ fn filter_options(ui: &mut Gui, g: &mut Game) {
     ui.label_col(&format!("This filter {}", describe_filter(w.rule, w.filter_z, w.threshold, w.only)), col::ACCENT);
 }
 
-fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actions) {
+fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actions, loader: (u32, u32)) {
     let re = &sim.reactor;
     let last = |f: &dyn Fn(&Sample) -> f32| -> f32 {
         let k = re.samples.len().min(8);
@@ -760,7 +760,7 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
             ui.slider(&format!("Strength of each of {} sources", re.sources.len()), &mut re.source_rate, 0.0, 5.0, Scale::Lin, 0.5, |v| format!("{v:.2} n/s"));
         }
     }
-    crate::tabs::spawners_section(ui, sim, ps);
+    crate::tabs::spawners_section(ui, sim, ps, loader);
     flow_tab(ui, sim);
     ui.heading("How to run it");
     let re = &sim.reactor;

@@ -29,11 +29,75 @@ pub fn regime(e_lab: f64) -> (&'static str, Color) {
     }
 }
 
+/// Edit a spawner's list of nuclides: (Z, N, weight). Returns whether it
+/// changed. An empty list means "just the one nuclide".
+fn mix_editor(ui: &mut Gui, list: &mut Vec<(u32, u32, u8)>, random: &mut bool, loader: (u32, u32), id: &str) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    for (k, m) in list.iter_mut().enumerate() {
+        let row = ui.alloc(30.0);
+        let (x, y, w) = (row.x, row.y, row.w);
+        ui.text(&nuclide_name(m.0, m.1), x, y + 6.0, ui.size - 1.0, col::TEXT);
+        ui.layout(x + 90.0, y, w - 90.0 - 80.0);
+        let mut wt = m.2 as u32;
+        if ui.stepper(&format!("weight##{id}w{k}"), &mut wt, 1, 20) {
+            m.2 = wt as u8;
+            changed = true;
+        }
+        ui.layout(x + w - 76.0, y, 76.0);
+        if ui.button(&format!("Remove##{id}r{k}")) {
+            remove = Some(k);
+        }
+        ui.layout(x, y + 34.0, w);
+    }
+    if let Some(k) = remove {
+        list.remove(k);
+        changed = true;
+    }
+    let name = nuclide_name(loader.0, loader.1);
+    let full = list.len() >= sim_core::reactor::MIX_MAX;
+    if !full && loader.0 + loader.1 > 0 && ui.button(&format!("Add {name} (from the loader)##{id}add")) {
+        match list.iter_mut().find(|m| (m.0, m.1) == loader) {
+            Some(m) => m.2 = m.2.saturating_add(1).min(20),
+            None => list.push((loader.0, loader.1, 1)),
+        }
+        changed = true;
+    }
+    if list.len() > 1 {
+        let mut k = *random as usize;
+        if ui.segmented(&[&format!("In turn##{id}t"), &format!("At random##{id}rn")], &mut k, 2) {
+            *random = k == 1;
+            changed = true;
+        }
+        let total: u32 = list.iter().map(|m| m.2 as u32).sum();
+        let share: Vec<String> = list.iter().map(|m| format!("{} {:.0}%", nuclide_name(m.0, m.1), 100.0 * m.2 as f32 / total as f32)).collect();
+        ui.note(&format!(
+            "{}: {}. Beams give each the same energy per nucleon.",
+            if *random { "Picked at random by weight" } else { "In turn, each weight times in a row" },
+            share.join(", ")
+        ));
+    }
+    changed
+}
+
 /// Settings for the next spawner (Build tab).
 pub fn new_spawner_options(ui: &mut Gui, sim: &Sim, g: &mut Game) {
     let mut k = g.beam as usize;
     if ui.segmented(&["Feed (drag sets speed)", "Beam (set energy)"], &mut k, 2) {
         g.beam = k == 1;
+    }
+    ui.note(if g.mix.is_empty() {
+        "Nuclides: the loader's (below). Add several to fire a mix - in turn or at random."
+    } else {
+        "Nuclides it fires:"
+    });
+    let loader = (g.z, g.n);
+    mix_editor(ui, &mut g.mix, &mut g.mix_random, loader, "new");
+    if g.mix.len() == 1 {
+        ui.note("Add another to make it a mix (one alone is just that nuclide).");
+    }
+    if !g.mix.is_empty() && ui.button("Back to one nuclide (the loader's)") {
+        g.mix.clear();
     }
     ui.slider("Rate", &mut g.spawn_rate, 0.1, 30.0, Scale::Log, 2.0, |v| format!("{v:.1}/s"));
     if g.beam {
@@ -63,7 +127,7 @@ pub fn new_spawner_options(ui: &mut Gui, sim: &Sim, g: &mut Game) {
 }
 
 /// Edit the spawners in the scene (Reactions tab).
-pub fn spawners_section(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState) {
+pub fn spawners_section(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, loader: (u32, u32)) {
     if sim.reactor.spawners.is_empty() {
         return;
     }
@@ -80,9 +144,9 @@ pub fn spawners_section(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState) {
         let title = if sp.keep > 0 {
             format!("{}. {} feed: keeps {} in its area ({} added)", k + 1, nuclide_name(sp.z, sp.n), sp.keep, sp.spawned)
         } else if sp.beam {
-            format!("{}. {} beam, {}/u, {:.1}/s  ({} fired)", k + 1, nuclide_name(sp.z, sp.n), format_energy(e), sp.rate, sp.spawned)
+            format!("{}. {} beam, {}/u, {:.1}/s  ({} fired)", k + 1, sp.label(), format_energy(e), sp.rate, sp.spawned)
         } else {
-            format!("{}. {} feed, {:.0} px/s, {:.1}/s  ({} made)", k + 1, nuclide_name(sp.z, sp.n), sp.vel.length(), sp.rate, sp.spawned)
+            format!("{}. {} feed, {:.0} px/s, {:.1}/s  ({} made)", k + 1, sp.label(), sp.vel.length(), sp.rate, sp.spawned)
         };
         let open = ps.open_spawner == Some(k);
         if ui.button(&format!("{}{title}##spw{k}", if open { "▾ " } else { "▸ " })) {
@@ -98,6 +162,16 @@ pub fn spawners_section(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState) {
             }
         } else {
             ui.checkbox(&format!("Beam mode (set energy, width, pulses)##bm{k}"), &mut sp.beam);
+            ui.note("Nuclides:");
+            let mut list: Vec<(u32, u32, u8)> = if sp.is_mix() { sp.nuclides() } else { vec![(sp.z, sp.n, 1)] };
+            let mut random = sp.mix_random;
+            if mix_editor(ui, &mut list, &mut random, loader, &format!("sp{k}")) {
+                if list.is_empty() {
+                    list.push((sp.z, sp.n, 1));
+                }
+                sp.set_mix(&list);
+                sp.mix_random = random;
+            }
             ui.slider(&format!("Rate##r{k}"), &mut sp.rate, 0.0, 30.0, Scale::Log, 2.0, |v| format!("{v:.1}/s"));
             let dir = sp.vel.normalize_or(Vec2::X);
             if sp.beam {
@@ -718,9 +792,29 @@ pub fn isotopes_tab(ui: &mut Gui, sim: &Sim, g: &mut Game, ps: &mut PanelState) 
     }
     if hov {
         let m: Vec2 = mouse_position().into();
-        let n = (ch.n0 + (m.x - r.x) / cell).floor();
-        let z = (ch.z0 + (r.bottom() - m.y) / cell).floor();
+        let mut n = (ch.n0 + (m.x - r.x) / cell).floor();
+        let mut z = (ch.z0 + (r.bottom() - m.y) / cell).floor();
+        // Zoomed out, what's present is drawn bigger than its cell: hovering
+        // such a marker means that nuclide, not the neighbour under it.
+        let grow = ((5.0 - cell) * 0.5).max(0.0);
+        if grow > 0.0 {
+            let hit = census.iter().filter(|((cz, cn), _)| {
+                let p = vec2(r.x + (*cn as f32 - ch.n0) * cell, r.y + r.h - (*cz as f32 - ch.z0 + 1.0) * cell);
+                Rect::new(p.x - grow, p.y - grow, cell + 2.0 * grow, cell + 2.0 * grow).contains(m)
+            });
+            if let Some(((cz, cn), _)) = hit.min_by(|a, b| {
+                let d = |c: &((u32, u32), u32)| vec2(r.x + (c.0.1 as f32 - ch.n0 + 0.5) * cell, r.y + r.h - (c.0.0 as f32 - ch.z0 + 0.5) * cell).distance(m);
+                d(a).total_cmp(&d(b))
+            }) {
+                n = *cn as f32;
+                z = *cz as f32;
+            }
+        }
         if n >= 0.0 && z >= 0.0 {
+            // Outline what the tooltip describes.
+            let p = vec2(r.x + (n - ch.n0) * cell, r.y + r.h - (z - ch.z0 + 1.0) * cell);
+            let pad = grow.max(1.0);
+            draw_rectangle_lines(p.x - pad, p.y - pad, cell + 2.0 * pad, cell + 2.0 * pad, 1.5, col::ACCENT);
             let (z, n) = (z as u32, n as u32);
             let mut lines = describe(z, n, &sim.cfg);
             if lines.is_empty() {

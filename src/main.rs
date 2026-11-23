@@ -149,6 +149,10 @@ pub struct Game {
     pub beam_div: f32,
     pub beam_pulse: f32,
     pub beam_pulse_len: f32,
+    /// Next spawner fires these nuclides (Z, N, weight), in turn or at
+    /// random; empty = the loader's nuclide.
+    pub mix: Vec<(u32, u32, u8)>,
+    pub mix_random: bool,
     /// Next detector: a line (else a box), its filter (DetectFilter index)
     /// and whether it counts photons and neutrinos.
     pub det_line: bool,
@@ -203,7 +207,7 @@ fn part_info(sim: &Sim, p: Vec2, pick: f32) -> Option<Vec<String>> {
     let re = &sim.reactor;
     if let Some(sp) = re.spawners.iter().find(|s| s.pos.distance(p) < pick + 5.0) {
         let mut l = vec![
-            format!("{}: {}", if sp.beam { "Beam" } else { "Spawner" }, sim_core::nucdata::nuclide_name(sp.z, sp.n)),
+            format!("{}: {}", if sp.beam { "Beam" } else { "Spawner" }, sp.label()),
             if sp.keep > 0 {
                 format!("keeps {} of them in its area ({} added)", sp.keep, sp.spawned)
             } else if sp.beam {
@@ -378,6 +382,8 @@ async fn main() {
         beam_div: 0.0,
         beam_pulse: 0.0,
         beam_pulse_len: 0.5,
+        mix: Vec::new(),
+        mix_random: false,
         det_line: false,
         det_filter: 0,
         det_light: false,
@@ -451,6 +457,17 @@ async fn main() {
             g.z = 2;
             g.n = 2;
             g.beam_mev = 30.0;
+        }
+        Ok("mix") => {
+            g.tool = Tool::Spawner;
+            g.beam = true;
+            g.beam_mev = 0.5;
+            g.mix = vec![(1, 1, 1), (1, 2, 2)];
+            g.mix_random = true;
+            let mut b = Spawner::beam(&sim.cfg, vec2(700.0, 450.0), 1, 1, Vec2::X, 0.5, 10.0);
+            b.width = 80.0;
+            b.set_mix(&g.mix);
+            sim.reactor.spawners.push(b);
         }
         Ok("detector") => g.tool = Tool::Detector,
         Ok("field") => g.tool = Tool::Field,
@@ -550,7 +567,7 @@ async fn main() {
                                 ok
                             }
                             Tool::Spawner => {
-                                if g.z + g.n > 0 {
+                                if g.z + g.n > 0 || !g.mix.is_empty() {
                                     if g.beam {
                                         let drag = screen_mouse - s0;
                                         let dir = if drag.length() > 3.0 { drag.normalize() } else { Vec2::X };
@@ -560,9 +577,14 @@ async fn main() {
                                         b.divergence = g.beam_div.to_radians();
                                         b.pulse_period = g.beam_pulse;
                                         b.pulse_len = g.beam_pulse_len;
+                                        b.set_mix(&g.mix);
+                                        b.mix_random = g.mix_random;
                                         sim.reactor.spawners.push(b);
                                     } else {
-                                        sim.reactor.spawners.push(Spawner::new(at, g.z, g.n, v, g.spawn_rate));
+                                        let mut b = Spawner::new(at, g.z, g.n, v, g.spawn_rate);
+                                        b.set_mix(&g.mix);
+                                        b.mix_random = g.mix_random;
+                                        sim.reactor.spawners.push(b);
                                     }
                                 }
                                 true

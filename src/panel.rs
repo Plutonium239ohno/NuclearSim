@@ -3,15 +3,15 @@
 use crate::gui::{Gui, Scale, col};
 use crate::{Game, Tool};
 use macroquad::prelude::*;
-use particle_sim::game_scenes::{self as scenes, PRESETS, list_scenes, scene_dir};
-use particle_sim::nucdata::{self, Mode, format_time, info, nuclide_name, parse_nuclide};
-use particle_sim::nuclear::{EventKind, format_energy, sim_half_life, speed_for};
-use particle_sim::reactions;
-use particle_sim::reactor::SAMPLE_DT;
-use particle_sim::reactor::DrainFilter;
-use particle_sim::render::ViewMode;
-use particle_sim::walls::WallKind;
-use particle_sim::sim::{Config, Sim};
+use sim_core::game_scenes::{self as scenes, PRESETS, list_scenes, scene_dir};
+use sim_core::nucdata::{self, Mode, format_time, info, nuclide_name, parse_nuclide};
+use sim_core::nuclear::{EventKind, format_energy, sim_half_life, speed_for};
+use sim_core::reactions;
+use sim_core::reactor::SAMPLE_DT;
+use sim_core::reactor::DrainFilter;
+use sim_core::render::ViewMode;
+use sim_core::walls::WallKind;
+use sim_core::sim::{Config, Sim};
 
 pub const PANEL_W: f32 = 420.0;
 
@@ -466,7 +466,7 @@ fn thickness_slider(ui: &mut Gui, g: &mut Game) {
 
 /// What a new filter wall sorts by, and which way.
 fn filter_options(ui: &mut Gui, g: &mut Game) {
-    use particle_sim::walls::{FilterRule, describe_filter};
+    use sim_core::walls::{FilterRule, describe_filter};
     let w = &mut g.wall;
     let names: Vec<&str> = FilterRule::ALL.iter().map(|r| r.name()).collect();
     let mut k = FilterRule::ALL.iter().position(|&r| r == w.rule).unwrap_or(0);
@@ -501,7 +501,7 @@ fn filter_options(ui: &mut Gui, g: &mut Game) {
         }
         FilterRule::Charged => ui.note("Charged: protons, nuclei, electrons, positrons. Neutral: free neutrons (photons and neutrinos pass every wall)."),
         FilterRule::Energy => {
-            ui.slider("Energy threshold", &mut w.threshold, 1e-9, 200.0, Scale::Log, 1.0, |v| particle_sim::nuclear::format_energy(v as f64));
+            ui.slider("Energy threshold", &mut w.threshold, 1e-9, 200.0, Scale::Log, 1.0, |v| sim_core::nuclear::format_energy(v as f64));
             ui.note("Kinetic energy of the whole particle or nucleus. Thermal neutrons ~25 meV, fission neutrons ~2 MeV, alphas ~5 MeV, fission fragments ~70-100 MeV. Hover a particle to see its energy.");
         }
         FilterRule::Mass => {
@@ -625,7 +625,7 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
     let re = &sim.reactor;
     if re.spawners.iter().any(|s| s.keep > 0) {
         ui.note("Molten salt: the fuel is in the salt, and its concentration (the fuel feed above) sets the power more than the rods do - the salt moderates poorly, so most fissions happen at keV energies where boron is nearly transparent. The salt's heat leaves through the conductor wall into the helium stream. The freeze plug in the floor is the safety: run it flat out (rods out, lots of fuel) for a couple of minutes and the salt gets hot enough to melt it; the salt drains into the tank below and the chain reaction stops. Its melt point is in the Physics tab.");
-    } else if re.drains.iter().any(|d| d.filter == particle_sim::reactor::DrainFilter::All) && re.spawners.iter().any(|s| s.z + s.n <= 2) {
+    } else if re.drains.iter().any(|d| d.filter == sim_core::reactor::DrainFilter::All) && re.spawners.iter().any(|s| s.z + s.n <= 2) {
         ui.note("Rocket: withdraw the rods to heat the core. Fission heat warms the moderator; the moderator heats the conductor plate; the hydrogen pumped under the plate picks the heat up and leaves through the nozzle. The exhaust reading under Drains is your exhaust speed and thrust - more power, hotter plate, faster exhaust.");
     } else {
         ui.note("Withdraw the rods until the period turns positive and power climbs, then insert them a little to hold it level. Delayed neutrons from fission products (Br-87, I-137) are what make this possible: watch the period, not the instantaneous count. Xe-135 builds up after a run at power and soaks up neutrons.");
@@ -634,8 +634,8 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
 
 /// Spawners, drains, pumps and heat.
 fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
-    use particle_sim::thermal::{format_kelvin, kelvin_of, region_theta};
-    use particle_sim::walls::WallKind;
+    use sim_core::thermal::{format_kelvin, kelvin_of, region_theta};
+    use sim_core::walls::WallKind;
     let cfg = sim.cfg.clone();
     let re = &mut sim.reactor;
     if !re.spawners.is_empty() {
@@ -806,7 +806,7 @@ fn scenes_tab(ui: &mut Gui, g: &mut Game, saved: &mut Vec<String>, act: &mut Act
 }
 
 fn physics_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
-    let d = particle_sim::nuclear::game_config();
+    let d = sim_core::nuclear::game_config();
     let c = &mut sim.cfg;
     ui.note("Right-click any slider to reset it.");
     ui.heading("Time");
@@ -847,7 +847,7 @@ fn physics_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
         ui.note("A free neutron interacts with a nucleus when it passes within  r = scale · σ ^ exponent  (σ = total cross-section in barns at that energy). Then it is absorbed with probability σ_abs / σ, else scattered. The exponent compresses real cross-sections, as energy and time are compressed.");
         ui.slider("Scale", &mut c.xs_scale, 0.5, 15.0, Scale::Log, d.xs_scale, |v| format!("{v:.1} px"));
         ui.slider("Exponent", &mut c.xs_exponent, 0.1, 0.5, Scale::Lin, d.xs_exponent, |v| format!("{v:.2}"));
-        let r = |z, n, e| particle_sim::nuclear::interaction_radius(c, z, n, e);
+        let r = |z, n, e| sim_core::nuclear::interaction_radius(c, z, n, e);
         let th = reactions::E_THERMAL;
         ui.note(&format!(
             "thermal n:  D {:.1} px   H {:.1}   C-12 {:.1}   U-238 {:.1}   U-235 {:.0}   B-10 {:.0}",
@@ -859,7 +859,7 @@ fn physics_tab(ui: &mut Gui, sim: &mut Sim, act: &mut Actions) {
     ui.heading("Heat");
     ui.slider("Cooling to the surroundings", &mut c.cooling, 0.0, 60.0, Scale::Lin, d.cooling, |v| if v == 0.0 { "off (adiabatic)".into() } else { format!("{v:.0} /s") });
     ui.slider("Fission heat kept in matter", &mut c.heat_fraction, 0.0, 0.2, Scale::Lin, d.heat_fraction, |v| format!("{:.1}%", v * 100.0));
-    ui.slider("Freeze plug melts at", &mut c.melt_temp, 300.0, 1e6, Scale::Log, d.melt_temp, |v| particle_sim::thermal::format_kelvin(v as f64));
+    ui.slider("Freeze plug melts at", &mut c.melt_temp, 300.0, 1e6, Scale::Log, d.melt_temp, |v| sim_core::thermal::format_kelvin(v as f64));
     ui.note("With cooling on, matter is held near the temperature above. Turn it off (the rocket and molten-salt scenes do) and heat from fission stays in the matter, moves through conductor walls and leaves through drains.");
     ui.heading("Shape & contacts");
     ui.slider("Roundness", &mut c.roundness, 0.0, 300.0, Scale::Lin, d.roundness, |v| format!("{v:.0}"));

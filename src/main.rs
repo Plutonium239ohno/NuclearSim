@@ -2,6 +2,7 @@
 //!
 //! Run: cargo run --release
 
+mod draw;
 mod panel;
 mod tabs;
 use sim_core::gui;
@@ -79,6 +80,20 @@ const TOOL_KEYS: [(KeyCode, Tool); 9] = [
 /// Tools laid out by dragging a rectangle.
 fn rect_tool(t: Tool) -> bool {
     matches!(t, Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field)
+}
+
+/// Where a rectangle-tool drag ends: on the grid; with Ctrl a square (a
+/// detector line instead snaps its angle).
+fn rect_end(g: &Game, a: Vec2, mouse: Vec2, ctrl: bool) -> Vec2 {
+    if g.tool == Tool::Detector && g.det_line {
+        return g.snap.end(a, mouse, ctrl);
+    }
+    let b = g.snap.point(mouse);
+    if ctrl && g.tool != Tool::Rod {
+        let s = (b.x - a.x).abs().max((b.y - a.y).abs());
+        return vec2(a.x + s * (b.x - a.x).signum(), a.y + s * (b.y - a.y).signum());
+    }
+    b
 }
 
 /// Fill a rectangle with nuclide (z, n) on a hexagonal lattice, `gap` px
@@ -168,6 +183,11 @@ pub struct Game {
     pub sel_last: Option<(u32, u32)>,
     pub follow: bool,
     pub follow_products: bool,
+    /// Wall drawing: the shape, a circle's number of sides, and snapping
+    /// (grid: G, angle: hold Ctrl).
+    pub wall_shape: draw::Shape,
+    pub circle_sides: u32,
+    pub snap: draw::Snap,
 }
 
 impl Game {
@@ -394,6 +414,9 @@ async fn main() {
         sel_last: None,
         follow: false,
         follow_products: true,
+        wall_shape: draw::Shape::Freehand,
+        circle_sides: 32,
+        snap: draw::Snap::default(),
     };
     let mut saved = scenes::list_scenes();
     let mut zoom = Zoom::default();
@@ -401,6 +424,9 @@ async fn main() {
     let mut wall_last: Option<Vec2> = None;
     let mut wall_start: Option<Vec2> = None;
     let mut rect_start: Option<Vec2> = None;
+    // Polygon walls: the corners so far, and the last click (double-click ends).
+    let mut poly: Vec<Vec2> = Vec::new();
+    let mut last_click: (f64, Vec2) = (-1.0, Vec2::ZERO);
 
     // Dev automation (see the sandbox): PARTICLE_SIM_SCENE=<preset index>,
     // PARTICLE_SIM_ZOOM=1 opens a locked zoom, PARTICLE_SIM_SHOT=<png>.
@@ -470,6 +496,19 @@ async fn main() {
             sim.reactor.spawners.push(b);
         }
         Ok("detector") => g.tool = Tool::Detector,
+        Ok("wall") => {
+            g.tool = Tool::Wall;
+            g.wall_shape = draw::Shape::Circle;
+            g.snap.grid_on = true;
+            // A demo of the shapes (screenshots).
+            let spec = g.wall;
+            for (a, b) in draw::segments(draw::Shape::Circle, vec2(900.0, 450.0), vec2(1060.0, 450.0), 12, false)
+                .into_iter()
+                .chain(draw::segments(draw::Shape::Rect, vec2(1200.0, 300.0), vec2(1400.0, 600.0), 0, false))
+            {
+                sim.walls.add_spec(a, b, &spec);
+            }
+        }
         Ok("field") => g.tool = Tool::Field,
         Ok("pump") => {
             g.tool = Tool::Pump;
@@ -514,6 +553,8 @@ async fn main() {
         }
 
         let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+        // Hold Ctrl: directions snap to the angle step.
+        let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
         let screen_mouse: Vec2 = mouse_position().into();
 
         // ---- Zoom & mouse mapping ----
@@ -553,11 +594,12 @@ async fn main() {
         match g.tool {
             Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner => {
                 if lmb_pressed {
-                    drag_start = Some((mouse, screen_mouse));
+                    drag_start = Some((g.snap.point(mouse), screen_mouse));
                 }
                 if is_mouse_button_released(MouseButton::Left) {
                     if let Some((at, s0)) = drag_start.take() {
-                        let v = launch_velocity(screen_mouse - s0, sim.cfg.max_speed);
+                        let aim = if ctrl { g.snap.angle(screen_mouse - s0) } else { screen_mouse - s0 };
+                        let v = launch_velocity(aim, sim.cfg.max_speed);
                         let ok = match g.tool {
                             Tool::Nucleus => {
                                 let ok = place_nucleus(&mut sim, at, g.z, g.n, v);
@@ -569,8 +611,7 @@ async fn main() {
                             Tool::Spawner => {
                                 if g.z + g.n > 0 || !g.mix.is_empty() {
                                     if g.beam {
-                                        let drag = screen_mouse - s0;
-                                        let dir = if drag.length() > 3.0 { drag.normalize() } else { Vec2::X };
+                                        let dir = if aim.length() > 3.0 { aim.normalize() } else { Vec2::X };
                                         let mut b = Spawner::beam(&sim.cfg, at, g.z, g.n, dir, g.beam_mev as f64, g.spawn_rate);
                                         b.width = g.beam_width;
                                         b.energy_spread = g.beam_spread;
@@ -658,10 +699,11 @@ async fn main() {
             }
             Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field => {
                 if lmb_pressed {
-                    rect_start = Some(mouse);
+                    rect_start = Some(g.snap.point(mouse));
                 }
                 if !is_mouse_button_down(MouseButton::Left) {
                     if let Some(a) = rect_start.take() {
+                        let mouse = rect_end(&g, a, mouse, ctrl);
                         let r = Rect::new(a.x.min(mouse.x), a.y.min(mouse.y), (a.x - mouse.x).abs(), (a.y - mouse.y).abs());
                         let drag = mouse - a;
                         let rn = sim.types[ids::NEUTRON as usize].radius;
@@ -722,27 +764,70 @@ async fn main() {
             Tool::Wall => {
                 let spec = g.wall;
                 let add = |sim: &mut Sim, a: Vec2, b: Vec2| sim.walls.add_spec(a, b, &spec);
-                if lmb_pressed {
-                    wall_last = Some(mouse);
-                    wall_start = Some(mouse);
-                }
-                if lmb_down && !shift {
-                    if let Some(last) = wall_last {
-                        if last.distance(mouse) > 8.0 / world_scale {
-                            add(&mut sim, last, mouse);
+                match g.wall_shape {
+                    draw::Shape::Freehand => {
+                        if lmb_pressed {
                             wall_last = Some(mouse);
+                            wall_start = Some(mouse);
+                        }
+                        if lmb_down && !shift {
+                            if let Some(last) = wall_last {
+                                if last.distance(mouse) > 8.0 / world_scale {
+                                    add(&mut sim, last, mouse);
+                                    wall_last = Some(mouse);
+                                }
+                            }
+                            wall_start = wall_last;
+                        }
+                        if !is_mouse_button_down(MouseButton::Left) {
+                            match (wall_start, shift, wall_last) {
+                                (Some(a), true, _) if a.distance(mouse) > 2.0 => add(&mut sim, a, g.snap.end(a, mouse, ctrl)),
+                                (_, false, Some(last)) if last.distance(mouse) > 1.0 => add(&mut sim, last, mouse),
+                                _ => {}
+                            }
+                            wall_last = None;
+                            wall_start = None;
                         }
                     }
-                    wall_start = wall_last;
-                }
-                if !is_mouse_button_down(MouseButton::Left) {
-                    match (wall_start, shift, wall_last) {
-                        (Some(a), true, _) if a.distance(mouse) > 2.0 => add(&mut sim, a, mouse),
-                        (_, false, Some(last)) if last.distance(mouse) > 1.0 => add(&mut sim, last, mouse),
-                        _ => {}
+                    draw::Shape::Polygon => {
+                        if lmb_pressed {
+                            let now = get_time();
+                            let p = match poly.last() {
+                                Some(&prev) => g.snap.end(prev, mouse, ctrl),
+                                None => g.snap.point(mouse),
+                            };
+                            let double = now - last_click.0 < 0.35 && last_click.1.distance(screen_mouse) < 6.0;
+                            last_click = (now, screen_mouse);
+                            if double {
+                                poly.clear(); // double-click: done (open shape)
+                            } else if poly.len() >= 2 && p.distance(poly[0]) < 10.0 / world_scale {
+                                add(&mut sim, *poly.last().unwrap(), poly[0]); // closed
+                                poly.clear();
+                            } else {
+                                if let Some(&prev) = poly.last() {
+                                    if prev.distance(p) > 1.0 {
+                                        add(&mut sim, prev, p);
+                                    }
+                                }
+                                poly.push(p);
+                            }
+                        }
                     }
-                    wall_last = None;
-                    wall_start = None;
+                    shape => {
+                        if lmb_pressed {
+                            wall_start = Some(g.snap.point(mouse));
+                        }
+                        if !is_mouse_button_down(MouseButton::Left) {
+                            if let Some(a) = wall_start.take() {
+                                let b = g.snap.end(a, mouse, ctrl && shape != draw::Shape::Rect);
+                                if a.distance(b) > 2.0 {
+                                    for (p, q) in draw::segments(shape, a, b, g.circle_sides, ctrl) {
+                                        add(&mut sim, p, q);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Tool::EraseWall => {
@@ -770,6 +855,9 @@ async fn main() {
         }
         if !rect_tool(g.tool) {
             rect_start = None;
+        }
+        if g.tool != Tool::Wall || g.wall_shape != draw::Shape::Polygon {
+            poly.clear();
         }
         // Mouse force: right button with any tool, left with the Force tool.
         let pushing = !blocked && (is_mouse_button_down(MouseButton::Right) || (g.tool == Tool::Force && lmb_down));
@@ -819,6 +907,7 @@ async fn main() {
 
         // ---- Draw ----
         renderer.draw(&sim, &g.view);
+        draw::draw_grid(&g.snap, sim.width, sim.height, left);
         if let Some((p, a)) = sel_pos {
             let r = if sim.point_nuclei { 9.0 } else { sim.types[ids::NEUTRON as usize].radius * (a as f32 / 0.9069).sqrt() + 6.0 };
             let pulse = 0.6 + 0.3 * (get_time() as f32 * 5.0).sin();
@@ -827,14 +916,16 @@ async fn main() {
         }
         // Drag-to-launch preview.
         if let Some((at, s0)) = drag_start {
-            let v = launch_velocity(screen_mouse - s0, sim.cfg.max_speed);
+            let aim = if ctrl { g.snap.angle(screen_mouse - s0) } else { screen_mouse - s0 };
+            let v = launch_velocity(aim, sim.cfg.max_speed);
             let a = match g.tool {
                 Tool::Nucleus | Tool::Spawner => (g.z + g.n).max(1) as f32,
                 _ => sim.types[ids::ELECTRON as usize].mass,
             };
             let e = energy_of(&sim.cfg, v.length(), a);
             let start = if in_window { dst.point() + (at - src.point()) * zoom.factor } else { at };
-            draw_line(start.x, start.y, screen_mouse.x, screen_mouse.y, 2.0, Color::new(1.0, 0.85, 0.3, 0.8));
+            let tip = start + aim;
+            draw_line(start.x, start.y, tip.x, tip.y, 2.0, Color::new(1.0, 0.85, 0.3, 0.8));
             draw_circle(start.x, start.y, 4.0, Color::new(1.0, 0.85, 0.3, 0.8));
             let label = if g.tool == Tool::Spawner && g.beam {
                 format!("beam: {}/u   {} total", format_energy(g.beam_mev as f64), format_energy(g.beam_mev as f64 * a as f64))
@@ -845,14 +936,50 @@ async fn main() {
             };
             draw_text(&label, screen_mouse.x + 12.0, screen_mouse.y - 10.0, 18.0, Color::new(1.0, 0.9, 0.5, 1.0));
         }
-        if let (Some(a), true, Tool::Wall) = (wall_start, shift, g.tool) {
-            draw_line(a.x, a.y, mouse.x, mouse.y, g.wall.half * 2.0, Color::new(0.6, 0.65, 0.8, 0.5));
+        if g.tool == Tool::Wall {
+            let w = g.wall.half * 2.0;
+            match (g.wall_shape, wall_start) {
+                (draw::Shape::Freehand, Some(a)) if shift => {
+                    let b = g.snap.end(a, mouse, ctrl);
+                    draw::preview(&[(a, b)], w);
+                    draw::label(&draw::readout(draw::Shape::Line, a, b, 0, ctrl), screen_mouse);
+                }
+                (draw::Shape::Line | draw::Shape::Rect | draw::Shape::Circle, Some(a)) => {
+                    let shape = g.wall_shape;
+                    let b = g.snap.end(a, mouse, ctrl && shape != draw::Shape::Rect);
+                    draw::preview(&draw::segments(shape, a, b, g.circle_sides, ctrl), w);
+                    if shape == draw::Shape::Circle {
+                        draw_circle(a.x, a.y, 2.0, Color::new(0.6, 0.65, 0.8, 0.8));
+                    }
+                    draw::label(&draw::readout(shape, a, b, g.circle_sides, ctrl), screen_mouse);
+                }
+                (draw::Shape::Polygon, _) => {
+                    if let Some(&prev) = poly.last() {
+                        let b = g.snap.end(prev, mouse, ctrl);
+                        draw::preview(&[(prev, b)], w);
+                        let close = poly.len() >= 2 && b.distance(poly[0]) < 10.0 / world_scale;
+                        draw_circle_lines(poly[0].x, poly[0].y, 6.0, 1.0, Color::new(0.6, 1.0, 0.7, if close { 0.9 } else { 0.4 }));
+                        let tip = if close { "click: close the shape".to_string() } else { draw::readout(draw::Shape::Line, prev, b, 0, ctrl) };
+                        draw::label(&tip, screen_mouse);
+                    }
+                    for p in &poly {
+                        draw_circle(p.x, p.y, 2.5, Color::new(0.6, 0.65, 0.8, 0.9));
+                    }
+                }
+                _ => {}
+            }
+            if !over_ui && wall_start.is_none() && poly.is_empty() && g.wall_shape != draw::Shape::Freehand {
+                let p = g.snap.point(mouse);
+                draw_circle_lines(p.x, p.y, 3.0, 1.0, Color::new(0.6, 0.65, 0.8, 0.6));
+            }
         }
         if let Some(a) = rect_start {
+            let mouse = rect_end(&g, a, mouse, ctrl);
             let rn = sim.types[ids::NEUTRON as usize].radius;
             let col = Color::new(0.8, 0.82, 0.9, 0.7);
             if g.tool == Tool::Detector && g.det_line {
                 draw_line(a.x, a.y, mouse.x, mouse.y, 1.5, Color::new(0.55, 1.0, 0.6, 0.8));
+                draw::label(&draw::readout(draw::Shape::Line, a, mouse, 0, ctrl), screen_mouse);
             } else if g.tool == Tool::Rod {
                 let (top, bottom) = (a.y.min(mouse.y), a.y.max(mouse.y));
                 draw_rectangle_lines(a.x - 1.25 * rn, top, 2.5 * rn, bottom - top, 1.0, col);
@@ -961,6 +1088,13 @@ async fn main() {
             }
             if is_key_pressed(KeyCode::F) { g.tool = Tool::Force; }
             if is_key_pressed(KeyCode::I) { g.tool = Tool::Inspect; }
+            if is_key_pressed(KeyCode::G) {
+                g.snap.grid_on = !g.snap.grid_on;
+                g.say(if g.snap.grid_on { format!("Grid snap on ({:.0} px)", g.snap.grid) } else { "Grid snap off".to_string() });
+            }
+            if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+                poly.clear();
+            }
             if is_key_pressed(KeyCode::K) { g.tool = Tool::Detector; }
             if is_key_pressed(KeyCode::M) { g.tool = Tool::Field; }
             if is_key_pressed(KeyCode::P) {
@@ -976,7 +1110,9 @@ async fn main() {
             if is_key_pressed(KeyCode::Z) && !ctrl {
                 zoom.toggle();
             }
-            if is_key_pressed(KeyCode::Escape) { zoom.state = ZoomState::Off; }
+            if is_key_pressed(KeyCode::Escape) {
+                if poly.is_empty() { zoom.state = ZoomState::Off; } else { poly.clear(); }
+            }
             // Rod bank: arrows drive the rods in 5% steps, X scrams.
             let re = &mut sim.reactor;
             if !re.rods.is_empty() {

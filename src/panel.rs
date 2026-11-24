@@ -352,7 +352,7 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
         Tool::Nucleus => "Click: place the nucleus below at rest.  Drag: launch it (energy shown).",
         Tool::Electron | Tool::Positron => "Click to place, drag to launch.",
         Tool::Erase => "Hold to erase nuclei and any reactor part (rods, channels, sources, spawners, drains, pumps).",
-        Tool::Wall => "Drag to draw walls; Shift-drag for a straight wall.",
+        Tool::Wall => "Draw walls in the shape below.",
         Tool::EraseWall => "Hold to erase walls.",
         Tool::Rod => "Drag down to lay a control-rod channel. Rods move together from the Reactor tab.",
         Tool::FuelChannel => "Click to load the nuclide below and register a fuel channel the fuelling machine keeps loaded.",
@@ -371,6 +371,22 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
             ui.slider("Eraser size", &mut g.brush_radius, 5.0, 150.0, Scale::Lin, 20.0, |v| format!("{v:.0} px"));
         }
         Tool::Wall => {
+            ui.note("Shape");
+            let names: Vec<&str> = crate::draw::SHAPES.iter().map(|s| s.1).collect();
+            let mut k = crate::draw::SHAPES.iter().position(|s| s.0 == g.wall_shape).unwrap_or(0);
+            if ui.segmented(&names, &mut k, 3) {
+                g.wall_shape = crate::draw::SHAPES[k].0;
+            }
+            ui.note(match g.wall_shape {
+                crate::draw::Shape::Freehand => "Drag to draw; Shift-drag for a straight wall.",
+                crate::draw::Shape::Line => "Drag from one end to the other.",
+                crate::draw::Shape::Rect => "Drag from corner to corner (Ctrl: a square).",
+                crate::draw::Shape::Circle => "Drag from the centre outwards: a regular polygon with the sides below.",
+                crate::draw::Shape::Polygon => "Click each corner. Click the first corner to close the shape; double-click, Enter or Esc to stop with it open.",
+            });
+            if g.wall_shape == crate::draw::Shape::Circle {
+                ui.stepper("Sides", &mut g.circle_sides, 3, 96);
+            }
             let names: Vec<&str> = WallKind::ALL.iter().map(|k| k.name()).collect();
             let mut k = WallKind::ALL.iter().position(|&w| w == g.wall.kind).unwrap_or(0);
             if ui.segmented(&names, &mut k, 2) {
@@ -450,6 +466,19 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
             ui.slider("Spacing between nuclei", &mut g.fill_gap, 0.0, 40.0, Scale::Lin, 4.0, |v| format!("{v:.0} px"));
         }
         _ => {}
+    }
+
+    if matches!(
+        g.tool,
+        Tool::Wall | Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner | Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field
+    ) {
+        ui.heading("Snapping");
+        ui.checkbox("Snap points to a grid  [G]", &mut g.snap.grid_on);
+        if g.snap.grid_on {
+            ui.slider("Grid spacing", &mut g.snap.grid, 5.0, 100.0, Scale::Lin, 20.0, |v| format!("{v:.0} px"));
+        }
+        ui.slider("Angle step (hold Ctrl)", &mut g.snap.angle_step, 1.0, 90.0, Scale::Lin, 15.0, |v| format!("{v:.0}°"));
+        ui.note("Hold Ctrl while dragging: walls, launches, spawner aim and detector lines snap to the angle step; rectangles become squares.");
     }
 
     ui.heading("Nucleus loader");

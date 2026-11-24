@@ -17,7 +17,8 @@ for details.
 
 ## Tabs
 
-- **Build** — tools: nuclei, fill, spawners (feeds, or beams with an energy
+- **Build** — tools: walls (freehand, line, rectangle, circle, polygon;
+  grid and angle snapping), nuclei, fill, spawners (feeds, or beams with an energy
   per nucleon, width, energy spread, divergence and pulses), walls, pumps,
   drains, electric/magnetic field regions, control rods, fuel channels,
   neutron sources, the inspector and detectors.
@@ -52,3 +53,4 @@ for details.
 | F | push / pull | ↑ / ↓, X | rods, SCRAM |
 | V, L, O | colour, trails, overlay | P | point nuclei |
 | Z | magnifier | C | clear |
+| G | grid snap | Ctrl (hold) | snap angles / squares |

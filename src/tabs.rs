@@ -1,14 +1,14 @@
-//! The Measure, Auto and Isotopes tabs, and the spawner / beam editor and
-//! inventory used on the Reactions tab.
+//! The Measure and Isotopes tabs, the options for a new spawner (Build
+//! tab), the nuclide-mix editor and the inventory on the Reactions tab.
 
 use crate::Game;
 use crate::gui::{Gui, Scale, col};
 use crate::panel::{PanelState, describe, kind_color};
 use macroquad::prelude::*;
-use sim_core::control::{Action, Actuator, Measure, Rule, Trigger, watts};
+use sim_core::control::watts;
 use sim_core::detector::{self, DetShape, DetectFilter};
 use sim_core::nucdata::{self, Mode, nuclide_name};
-use sim_core::nuclear::{EventKind, FRAG_FULL, FRAG_RELATIVISTIC, FRAG_START, energy_of, format_energy};
+use sim_core::nuclear::{FRAG_FULL, FRAG_RELATIVISTIC, FRAG_START, energy_of, format_energy};
 use sim_core::reactor::max_beam_energy;
 use sim_core::sim::{Sim, unpack_zn};
 
@@ -30,17 +30,19 @@ pub fn regime(e_lab: f64) -> (&'static str, Color) {
 }
 
 /// Edit a spawner's list of nuclides: (Z, N, weight). Returns whether it
-/// changed. An empty list means "just the one nuclide".
-fn mix_editor(ui: &mut Gui, list: &mut Vec<(u32, u32, u8)>, random: &mut bool, loader: (u32, u32), id: &str) -> bool {
+/// changed. An empty list means "just the one nuclide". `add` is offered
+/// with an Add button.
+pub fn mix_editor(ui: &mut Gui, list: &mut Vec<(u32, u32, u8)>, random: &mut bool, add: Option<(u32, u32)>, id: &str) -> bool {
     let mut changed = false;
     let mut remove = None;
+    let mix = list.len() > 1;
     for (k, m) in list.iter_mut().enumerate() {
         let row = ui.alloc(30.0);
         let (x, y, w) = (row.x, row.y, row.w);
         ui.text(&nuclide_name(m.0, m.1), x, y + 6.0, ui.size - 1.0, col::TEXT);
         ui.layout(x + 90.0, y, w - 90.0 - 80.0);
         let mut wt = m.2 as u32;
-        if ui.stepper(&format!("weight##{id}w{k}"), &mut wt, 1, 20) {
+        if mix && ui.stepper(&format!("weight##{id}w{k}"), &mut wt, 1, 20) {
             m.2 = wt as u8;
             changed = true;
         }
@@ -54,14 +56,17 @@ fn mix_editor(ui: &mut Gui, list: &mut Vec<(u32, u32, u8)>, random: &mut bool, l
         list.remove(k);
         changed = true;
     }
-    let name = nuclide_name(loader.0, loader.1);
     let full = list.len() >= sim_core::reactor::MIX_MAX;
-    if !full && loader.0 + loader.1 > 0 && ui.button(&format!("Add {name} (from the loader)##{id}add")) {
-        match list.iter_mut().find(|m| (m.0, m.1) == loader) {
-            Some(m) => m.2 = m.2.saturating_add(1).min(20),
-            None => list.push((loader.0, loader.1, 1)),
+    if let Some(nuc) = add.filter(|a| a.0 + a.1 > 0 && !full) {
+        let name = nuclide_name(nuc.0, nuc.1);
+        let label = if list.iter().any(|m| (m.0, m.1) == nuc) { format!("One more {name} in the mix##{id}add") } else { format!("Add {name}##{id}add") };
+        if ui.button(&label) {
+            match list.iter_mut().find(|m| (m.0, m.1) == nuc) {
+                Some(m) => m.2 = m.2.saturating_add(1).min(20),
+                None => list.push((nuc.0, nuc.1, 1)),
+            }
+            changed = true;
         }
-        changed = true;
     }
     if list.len() > 1 {
         let mut k = *random as usize;
@@ -80,24 +85,20 @@ fn mix_editor(ui: &mut Gui, list: &mut Vec<(u32, u32, u8)>, random: &mut bool, l
     changed
 }
 
-/// Settings for the next spawner (Build tab).
+/// Settings for the next spawner (Build tab). What it fires is chosen in
+/// the nuclide picker below these.
 pub fn new_spawner_options(ui: &mut Gui, sim: &Sim, g: &mut Game) {
-    let mut k = g.beam as usize;
-    if ui.segmented(&["Feed (drag sets speed)", "Beam (set energy)"], &mut k, 2) {
-        g.beam = k == 1;
-    }
-    ui.note(if g.mix.is_empty() {
-        "Nuclides: the loader's (below). Add several to fire a mix - in turn or at random."
-    } else {
-        "Nuclides it fires:"
-    });
     let loader = (g.z, g.n);
-    mix_editor(ui, &mut g.mix, &mut g.mix_random, loader, "new");
-    if g.mix.len() == 1 {
-        ui.note("Add another to make it a mix (one alone is just that nuclide).");
-    }
-    if !g.mix.is_empty() && ui.button("Back to one nuclide (the loader's)") {
-        g.mix.clear();
+    if g.mix.is_empty() {
+        if ui.button(&format!("Fire a mix of nuclides instead (starting with {})", nuclide_name(g.z, g.n))) {
+            g.mix.push((g.z, g.n, 1));
+        }
+    } else {
+        ui.note("Fires this mix: choose another nuclide above, then add it.");
+        mix_editor(ui, &mut g.mix, &mut g.mix_random, Some(loader), "new");
+        if ui.button("No mix: fire just the nuclide above") {
+            g.mix.clear();
+        }
     }
     ui.slider("Rate", &mut g.spawn_rate, 0.1, 30.0, Scale::Log, 2.0, |v| format!("{v:.1}/s"));
     if g.beam {
@@ -122,128 +123,7 @@ pub fn new_spawner_options(ui: &mut Gui, sim: &Sim, g: &mut Game) {
         ));
         let (what, c) = regime(e);
         ui.label_sized(&format!("Regime: {what}"), ui.size - 2.0, c);
-        ui.note("Drag to aim (the drag sets the direction only). The Reactions tab lists every spawner for editing, and adds the opposing beam.");
-    }
-}
-
-/// Edit the spawners in the scene (Reactions tab).
-pub fn spawners_section(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, loader: (u32, u32)) {
-    if sim.reactor.spawners.is_empty() {
-        return;
-    }
-    ui.heading("Spawners and beams");
-    let cfg = sim.cfg.clone();
-    let meet = vec2((crate::panel::PANEL_W + sim.width) * 0.5, sim.height * 0.5);
-    let n = sim.reactor.spawners.len();
-    let mut remove = None;
-    let mut mirror = None;
-    for k in 0..n {
-        let sp = &mut sim.reactor.spawners[k];
-        let a = sp.a();
-        let e = sp.energy_per_nucleon(&cfg);
-        let title = if sp.keep > 0 {
-            format!("{}. {} feed: keeps {} in its area ({} added)", k + 1, nuclide_name(sp.z, sp.n), sp.keep, sp.spawned)
-        } else if sp.beam {
-            format!("{}. {} beam, {}/u, {:.1}/s  ({} fired)", k + 1, sp.label(), format_energy(e), sp.rate, sp.spawned)
-        } else {
-            format!("{}. {} feed, {:.0} px/s, {:.1}/s  ({} made)", k + 1, sp.label(), sp.vel.length(), sp.rate, sp.spawned)
-        };
-        let open = ps.open_spawner == Some(k);
-        if ui.button(&format!("{}{title}##spw{k}", if open { "▾ " } else { "▸ " })) {
-            ps.open_spawner = if open { None } else { Some(k) };
-        }
-        if !open {
-            continue;
-        }
-        if sp.keep > 0 {
-            let mut keep = sp.keep as f32;
-            if ui.slider(&format!("Keep in the salt##keep{k}"), &mut keep, 1.0, 40.0, Scale::Lin, 24.0, |v| format!("{:.0}", v.round())) {
-                sp.keep = keep.round() as u32;
-            }
-        } else {
-            ui.checkbox(&format!("Beam mode (set energy, width, pulses)##bm{k}"), &mut sp.beam);
-            ui.note("Nuclides:");
-            let mut list: Vec<(u32, u32, u8)> = if sp.is_mix() { sp.nuclides() } else { vec![(sp.z, sp.n, 1)] };
-            let mut random = sp.mix_random;
-            if mix_editor(ui, &mut list, &mut random, loader, &format!("sp{k}")) {
-                if list.is_empty() {
-                    list.push((sp.z, sp.n, 1));
-                }
-                sp.set_mix(&list);
-                sp.mix_random = random;
-            }
-            ui.slider(&format!("Rate##r{k}"), &mut sp.rate, 0.0, 30.0, Scale::Log, 2.0, |v| format!("{v:.1}/s"));
-            let dir = sp.vel.normalize_or(Vec2::X);
-            if sp.beam {
-                let top = max_beam_energy(&cfg) as f32;
-                let mut ev = (e as f32).clamp(1e-3, top);
-                if ui.slider(&format!("Energy per nucleon##e{k}"), &mut ev, 1e-3, top, Scale::Log, 1.0, |v| format_energy(v as f64) + "/u") {
-                    sp.set_energy(&cfg, dir, ev as f64);
-                }
-                ui.slider(&format!("Width##w{k}"), &mut sp.width, 0.0, 300.0, Scale::Lin, 12.0, |v| format!("{v:.0} px"));
-                ui.slider(&format!("Energy spread##s{k}"), &mut sp.energy_spread, 0.0, 0.3, Scale::Lin, 0.0, |v| format!("±{:.0}%", v * 100.0));
-                let mut deg = sp.divergence.to_degrees();
-                if ui.slider(&format!("Divergence##d{k}"), &mut deg, 0.0, 15.0, Scale::Lin, 0.0, |v| format!("±{v:.1}°")) {
-                    sp.divergence = deg.to_radians();
-                }
-                ui.slider(&format!("Pulse every##p{k}"), &mut sp.pulse_period, 0.0, 10.0, Scale::Lin, 0.0, |v| if v <= 0.0 { "continuous".into() } else { format!("{v:.1} s") });
-                if sp.pulse_period > 0.0 {
-                    let top = sp.pulse_period.max(0.1);
-                    ui.slider(&format!("Pulse length##pl{k}"), &mut sp.pulse_len, 0.05, top, Scale::Lin, 0.5, |v| format!("{v:.2} s"));
-                }
-                let mut ang = dir.y.atan2(dir.x).to_degrees();
-                if ui.slider(&format!("Direction##a{k}"), &mut ang, -180.0, 180.0, Scale::Lin, 0.0, |v| format!("{v:.0}°")) {
-                    let d = Vec2::from_angle(ang.to_radians());
-                    sp.set_energy(&cfg, d, e);
-                }
-                if e as f32 >= top * 0.999 {
-                    ui.label_sized("At the sim's speed limit: higher energies can't be shown.", ui.size - 2.5, col::WARN);
-                }
-                // What collisions at this energy do.
-                let partner = sim.reactor.spawners.iter().enumerate().find(|(j, o)| *j != k && o.vel.normalize_or_zero().dot(dir) < -0.9);
-                let mut lines = vec![format!("{} total; on the same nucleus at rest {} in the centre of mass", format_energy(e * a as f64), format_energy(e * a as f64 * 0.5))];
-                let mut e_lab = e;
-                if let Some((j, o)) = partner {
-                    let eo = o.energy_per_nucleon(&cfg);
-                    // Relative speed (non-relativistic): u = sqrt(E/m) per nucleon each way.
-                    e_lab = (e.sqrt() + eo.sqrt()).powi(2);
-                    let mu = (a * o.a()) as f64 / (a + o.a()) as f64;
-                    lines.push(format!("head-on with beam {}: {} in the centre of mass ({}/u beam-on-target equivalent)", j + 1, format_energy(mu * e_lab), format_energy(e_lab)));
-                }
-                for l in lines {
-                    ui.note(&l);
-                }
-                let (what, c) = regime(e_lab);
-                ui.label_sized(&format!("Regime: {what}"), ui.size - 2.0, c);
-            } else {
-                ui.note("A feed: nuclei start at its velocity from a small disc. Turn on beam mode to set an energy, a width and pulses.");
-            }
-        }
-        let labels = [format!("Opposing beam##m{k}"), format!("Fire 10 now##b{k}"), format!("Remove##x{k}")];
-        let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-        match ui.buttons(&refs) {
-            Some(0) => mirror = Some(k),
-            Some(1) => sim.reactor.spawners[k].burst += 10,
-            Some(2) => remove = Some(k),
-            _ => {}
-        }
-        ui.space(4.0);
-    }
-    if let Some(k) = mirror {
-        let m = sim.reactor.spawners[k].mirrored(meet);
-        sim.reactor.spawners.push(m);
-    }
-    if let Some(k) = remove {
-        sim.reactor.spawners.remove(k);
-        ps.open_spawner = None;
-    }
-    let re = &mut sim.reactor;
-    ui.slider("Throttle (all spawners)", &mut re.throttle, 0.0, 1.0, Scale::Lin, 1.0, |v| format!("{:.0}%", v * 100.0));
-    match ui.buttons(&["Stop all", "Run all", "Remove all"]) {
-        Some(0) => re.throttle = 0.0,
-        Some(1) => re.throttle = 1.0,
-        Some(2) => re.spawners.clear(),
-        _ => {}
+        ui.note("Drag to aim (the drag sets the direction only; hold Ctrl to snap it).");
     }
 }
 
@@ -277,7 +157,9 @@ pub fn inventory_section(ui: &mut Gui, sim: &Sim) {
         }
         ui.kv("Pool decay heat", &watts(inv.heat_w), col::WARN);
     }
-    ui.note("Decay heat on the sim's clock: what the radioactive nuclei give off per second of sim time (neutrinos' share excluded). It keeps coming after a SCRAM, from fission products in a reactor and from tritium and activation in a fusion machine.");
+    if inv.heat_w > 0.0 {
+        ui.note("Decay heat on the sim's clock: what the radioactive nuclei give off per second of sim time (neutrinos' share excluded). It keeps coming after a SCRAM, from fission products in a reactor and from tritium and activation in a fusion machine.");
+    }
 }
 
 // ------------------------------------------------------------------ measure
@@ -285,7 +167,6 @@ pub fn inventory_section(ui: &mut Gui, sim: &Sim) {
 pub fn measure_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
     inspector(ui, sim, g);
     detectors(ui, sim, g);
-    fields(ui, sim);
 }
 
 fn inspector(ui: &mut Gui, sim: &Sim, g: &mut Game) {
@@ -454,219 +335,6 @@ fn histogram(ui: &mut Gui, h: &[u64; detector::BINS]) {
     }
 }
 
-fn fields(ui: &mut Gui, sim: &mut Sim) {
-    ui.heading("Field regions  [M]");
-    if sim.reactor.fields.is_empty() {
-        ui.note("None yet. With the Field tool (M), drag a rectangle: an electric field pushes charges along it, a magnetic field bends them into circles (beams, plasma traps, mass separation). Neutrons ignore both.");
-        return;
-    }
-    let mut remove = None;
-    for (k, f) in sim.reactor.fields.iter_mut().enumerate() {
-        ui.label_col(&format!("Field {}", k + 1), col::ACCENT);
-        ui.slider(&format!("Magnetic: proton turn rate##b{k}"), &mut f.b, -10.0, 10.0, Scale::Lin, 0.0, |v| {
-            if v == 0.0 { "off".into() } else { format!("{:.2} rad/s {}", v.abs(), if v > 0.0 { "↺" } else { "↻" }) }
-        });
-        let mut e = f.e.length();
-        let mut ang = if e > 0.0 { f.e.y.atan2(f.e.x).to_degrees() } else { 0.0 };
-        let mut changed = ui.slider(&format!("Electric: push on a proton##e{k}"), &mut e, 0.0, 3000.0, Scale::Lin, 0.0, |v| if v == 0.0 { "off".into() } else { format!("{v:.0} px/s²") });
-        if e > 0.0 {
-            changed |= ui.slider(&format!("Direction##ea{k}"), &mut ang, -180.0, 180.0, Scale::Lin, 0.0, |v| format!("{v:.0}°"));
-        }
-        if changed {
-            f.e = Vec2::from_angle(ang.to_radians()) * e;
-        }
-        ui.note(&f.describe());
-        if let Some(r) = f.proton_radius(200.0) {
-            ui.note(&format!("A proton at 200 px/s circles at {r:.0} px; an alpha at the same speed at {:.0} px.", r * 2.0));
-        }
-        if ui.button(&format!("Remove##fx{k}")) {
-            remove = Some(k);
-        }
-        ui.space(4.0);
-    }
-    if let Some(k) = remove {
-        sim.reactor.fields.remove(k);
-    }
-}
-
-// --------------------------------------------------------------------- auto
-
-const TRIGGERS: [&str; 5] = ["At time", "Every", "Above", "Below", "First of"];
-const ACTIONS: [&str; 6] = ["SCRAM", "Rods to", "Throttle to", "Burst", "Sources to", "Pause"];
-const FIRST_KINDS: [EventKind; 5] = [EventKind::Fission, EventKind::Fusion, EventKind::Breakup, EventKind::Capture, EventKind::Decay];
-
-fn measures(sim: &Sim) -> Vec<Measure> {
-    let mut m: Vec<Measure> = Measure::ALL.iter().copied().filter(|m| !matches!(m, Measure::Detector(_))).collect();
-    for k in 0..sim.reactor.detectors.len() {
-        m.push(Measure::Detector(k));
-    }
-    m
-}
-
-/// Slider for a level of reading `m` (log scale in its range).
-fn level_slider(ui: &mut Gui, label: &str, m: Measure, v: &mut f64) -> bool {
-    let (lo, hi) = m.range();
-    let mut x = (*v).clamp(lo, hi) as f32;
-    let changed = ui.slider(label, &mut x, lo as f32, hi as f32, Scale::Log, ((lo * hi).sqrt()) as f32, |y| m.format(y as f64));
-    *v = x as f64;
-    changed
-}
-
-pub fn auto_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState) {
-    // ---- Controller ----
-    ui.heading("Controller");
-    ui.note("Holds a reading at a set point: with the control rods (fission), or by throttling every spawner (beams and fuel feeds - fusion, or a molten-salt feed).");
-    let ms = measures(sim);
-    let mut c = sim.reactor.controller;
-    ui.checkbox("On", &mut c.on);
-    let names: Vec<String> = ms.iter().map(|m| m.short().to_string() + &if let Measure::Detector(k) = m { format!(" {}", k + 1) } else { String::new() }).collect();
-    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let mut k = ms.iter().position(|m| *m == c.measure).unwrap_or(0);
-    if ui.segmented(&refs, &mut k, 4) {
-        c.measure = ms[k];
-        let (lo, hi) = c.measure.range();
-        c.setpoint = (lo * hi).sqrt();
-    }
-    level_slider(ui, &format!("Set point: {}", c.measure.name()), c.measure, &mut c.setpoint);
-    let mut a = (c.actuator == Actuator::Feeds) as usize;
-    if ui.segmented(&["Move the rods", "Throttle beams & feeds"], &mut a, 2) {
-        c.actuator = if a == 1 { Actuator::Feeds } else { Actuator::Rods };
-    }
-    ui.slider("Gain", &mut c.gain, 0.1, 5.0, Scale::Log, 1.0, |v| format!("×{v:.2}"));
-    let now = c.measure.value(sim);
-    ui.kv("Reading now", &now.map(|v| c.measure.format(v)).unwrap_or_else(|| "—".into()), col::TEXT);
-    match c.actuator {
-        Actuator::Rods if sim.reactor.rods.is_empty() => ui.label_sized("There are no control rods: lay some with the Control rod tool, or throttle the spawners.", ui.size - 2.0, col::WARN),
-        Actuator::Feeds if sim.reactor.spawners.is_empty() => ui.label_sized("There are no spawners to throttle.", ui.size - 2.0, col::WARN),
-        Actuator::Rods => ui.kv("Rods", &format!("{:.0}% in (target {:.0}%)", sim.reactor.insertion * 100.0, sim.reactor.target * 100.0), col::DIM),
-        Actuator::Feeds => ui.kv("Throttle", &format!("{:.0}%", sim.reactor.throttle * 100.0), col::DIM),
-    }
-    if c.measure == Measure::Period {
-        ui.note("Period: keeps the power from rising faster than one e-fold per set-point seconds (a startup rate limit).");
-    }
-    sim.reactor.controller = c;
-
-    // ---- Rules ----
-    ui.heading("Rules");
-    ui.note("Do something when something happens: trips that SCRAM, timed rod moves, beam pulses, a pause at the first fusion.");
-    let mut remove = None;
-    for (k, r) in sim.reactor.rules.iter_mut().enumerate() {
-        let row = ui.alloc(24.0);
-        let (x, y, w) = (row.x, row.y, row.w);
-        ui.layout(x, y, 26.0);
-        ui.checkbox(&format!("##en{k}"), &mut r.enabled);
-        ui.layout(x + 26.0, y, w - 26.0);
-        let fired = if r.fired > 0 { format!("   ({}×)", r.fired) } else { String::new() };
-        let (t, _) = ui.fit(&format!("{}{fired}", r.describe()), w - 26.0 - 80.0, 13.0);
-        ui.text(&t, x + 26.0, y + 4.0, 13.0, if r.enabled { col::TEXT } else { col::FAINT });
-        ui.layout(x + w - 76.0, y, 76.0);
-        if ui.button(&format!("Remove##rx{k}")) {
-            remove = Some(k);
-        }
-        ui.layout(x, y + 28.0, w);
-    }
-    if let Some(k) = remove {
-        sim.reactor.rules.remove(k);
-    }
-    if !sim.reactor.rules.is_empty() && ui.button("Re-arm all (fire again)") {
-        sim.reactor.rules.iter_mut().for_each(|r| r.rearm());
-    }
-
-    ui.heading("Quick rules");
-    let quick: [(&str, Rule); 6] = [
-        ("SCRAM if fission > 20/s", Rule::new(Trigger::Above(Measure::FissionRate, 20.0), Action::Scram)),
-        ("SCRAM if period < 10 s", Rule::new(Trigger::Below(Measure::Period, 10.0), Action::Scram)),
-        ("Stop beams if fusion > 20/s", Rule::new(Trigger::Above(Measure::FusionRate, 20.0), Action::Throttle(0.0))),
-        ("Pause at the first fusion", Rule::new(Trigger::First(EventKind::Fusion), Action::Pause)),
-        ("Rods to 50% at t + 10 s", Rule::new(Trigger::At(sim.nuclear.time + 10.0), Action::Rods(0.5))),
-        ("Burst of 5 every 2 s", Rule::new(Trigger::Every(2.0), Action::Burst(5))),
-    ];
-    let names: Vec<&str> = quick.iter().map(|q| q.0).collect();
-    if let Some(k) = ui.button_grid(&names, 2, None) {
-        sim.reactor.rules.push(quick[k].1);
-    }
-
-    // ---- Builder ----
-    ui.heading("New rule");
-    let b = &mut ps.rule;
-    ui.segmented(&TRIGGERS, &mut b.trigger, 5);
-    let ms = measures(sim);
-    match b.trigger {
-        0 => {
-            ui.slider("At sim time", &mut b.time, 0.0, 600.0, Scale::Lin, 10.0, |v| format!("{v:.1} s"));
-            ui.note(&format!("now t = {:.1} s", sim.nuclear.time));
-        }
-        1 => {
-            ui.slider("Every", &mut b.time, 0.1, 60.0, Scale::Log, 2.0, |v| format!("{v:.1} s"));
-        }
-        2 | 3 => {
-            let names: Vec<String> = ms.iter().map(|m| m.short().to_string() + &if let Measure::Detector(k) = m { format!(" {}", k + 1) } else { String::new() }).collect();
-            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-            b.measure = b.measure.min(ms.len() - 1);
-            ui.segmented(&refs, &mut b.measure, 4);
-            let m = ms[b.measure];
-            level_slider(ui, &format!("Level: {}", m.name()), m, &mut b.level);
-        }
-        _ => {
-            let names: Vec<&str> = FIRST_KINDS.iter().map(|k| k.name()).collect();
-            ui.segmented(&names, &mut b.kind, 5);
-        }
-    }
-    ui.segmented(&ACTIONS, &mut b.action, 3);
-    match b.action {
-        1 => {
-            ui.slider("Rods to", &mut b.value, 0.0, 1.0, Scale::Lin, 0.5, |v| format!("{:.0}% in", v * 100.0));
-        }
-        2 => {
-            ui.slider("Throttle to", &mut b.value, 0.0, 1.0, Scale::Lin, 0.0, |v| format!("{:.0}%", v * 100.0));
-        }
-        3 => {
-            ui.slider("Nuclei per spawner", &mut b.value, 1.0, 100.0, Scale::Log, 5.0, |v| format!("{:.0}", v.round()));
-        }
-        4 => {
-            ui.slider("Source strength", &mut b.value, 0.0, 5.0, Scale::Lin, 0.5, |v| format!("{v:.2} n/s"));
-        }
-        _ => {}
-    }
-    let trigger = match b.trigger {
-        0 => Trigger::At(b.time as f64),
-        1 => Trigger::Every(b.time.max(0.05) as f64),
-        2 => Trigger::Above(ms[b.measure.min(ms.len() - 1)], b.level),
-        3 => Trigger::Below(ms[b.measure.min(ms.len() - 1)], b.level),
-        _ => Trigger::First(FIRST_KINDS[b.kind.min(FIRST_KINDS.len() - 1)]),
-    };
-    let action = match b.action {
-        0 => Action::Scram,
-        1 => Action::Rods(b.value.clamp(0.0, 1.0)),
-        2 => Action::Throttle(b.value.clamp(0.0, 1.0)),
-        3 => Action::Burst(b.value.round().max(1.0) as u32),
-        4 => Action::Sources(b.value.max(0.0)),
-        _ => Action::Pause,
-    };
-    let rule = Rule::new(trigger, action);
-    ui.label_col(&rule.describe(), col::ACCENT);
-    if ui.button("Add this rule") {
-        sim.reactor.rules.push(rule);
-    }
-}
-
-/// The rule being put together on the Auto tab.
-pub struct RuleBuilder {
-    pub trigger: usize,
-    pub measure: usize,
-    pub level: f64,
-    pub time: f32,
-    pub kind: usize,
-    pub action: usize,
-    pub value: f32,
-}
-
-impl Default for RuleBuilder {
-    fn default() -> Self {
-        Self { trigger: 2, measure: 0, level: 10.0, time: 10.0, kind: 1, action: 0, value: 0.5 }
-    }
-}
-
 // ----------------------------------------------------------------- isotopes
 
 /// View of the chart of nuclides.
@@ -821,13 +489,10 @@ pub fn isotopes_tab(ui: &mut Gui, sim: &Sim, g: &mut Game, ps: &mut PanelState) 
                 lines.push("(nothing)".into());
             }
             let count = census.iter().find(|c| c.0 == (z, n)).map_or(0, |c| c.1);
-            lines.push(format!("{count} in the scene now. Click to load it into the Nucleus tool."));
+            lines.push(format!("{count} in the scene now. Click to choose it (for the Nucleus, Fill or Spawner tool)."));
             ui.tip(lines);
             if clicked && ui.mouse_delta().length() < 2.0 && z + n > 0 {
-                g.z = z;
-                g.n = n;
-                g.nuclide_text = nuclide_name(z, n);
-                g.tool = crate::Tool::Nucleus;
+                g.choose_nuclide(z, n);
             }
         }
     }

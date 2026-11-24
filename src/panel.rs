@@ -36,9 +36,9 @@ pub struct Actions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Build,
+    Controls,
     Reactor,
     Measure,
-    Auto,
     Isotopes,
     View,
     Scenes,
@@ -49,9 +49,9 @@ pub enum Tab {
 /// Two rows of tabs.
 const TABS: [(Tab, &str); 9] = [
     (Tab::Build, "Build"),
+    (Tab::Controls, "Controls"),
     (Tab::Reactor, "Reactions"),
     (Tab::Measure, "Measure"),
-    (Tab::Auto, "Auto"),
     (Tab::Isotopes, "Isotopes"),
     (Tab::View, "View"),
     (Tab::Scenes, "Scenes"),
@@ -83,15 +83,19 @@ pub struct PanelState {
     seed_text: String,
     /// Graph series shown (see SERIES).
     series: [bool; SERIES.len()],
-    /// Spawner whose editor is open on the Reactions tab.
-    pub open_spawner: Option<usize>,
-    pub rule: crate::tabs::RuleBuilder,
+    /// Collapsible sections: open or closed (by key).
+    pub open: std::collections::HashMap<&'static str, bool>,
+    /// Spawners whose editors are open on the Controls tab (by index).
+    pub spawner_open: std::collections::HashMap<usize, bool>,
+    /// What's typed in each spawner's "add a nuclide" box.
+    pub add_text: std::collections::HashMap<usize, String>,
+    pub rule: crate::controls::RuleBuilder,
     pub chart: crate::tabs::Chart,
 }
 
 impl Default for PanelState {
     fn default() -> Self {
-        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new(), series: [true, true, true, false, false, true, false, false], open_spawner: None, rule: Default::default(), chart: Default::default() }
+        Self { tab: Tab::Build, filter: 0, search: String::new(), shown: Vec::new(), cache_key: (usize::MAX, String::new()), seen: 0, seed_text: String::new(), series: [true, true, true, false, false, true, false, false], open: Default::default(), spawner_open: Default::default(), add_text: Default::default(), rule: Default::default(), chart: Default::default() }
     }
 }
 
@@ -295,10 +299,10 @@ pub fn draw(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState, save
         tab => {
             ui.scroll_begin(TABS[k].1, body);
             match tab {
-                Tab::Build => build_tab(ui, sim, g),
-                Tab::Reactor => reactor_tab(ui, sim, ps, &mut act, (g.z, g.n)),
+                Tab::Build => build_tab(ui, sim, g, ps),
+                Tab::Controls => crate::controls::controls_tab(ui, sim, ps, &mut act),
+                Tab::Reactor => reactor_tab(ui, sim, ps, &mut act),
                 Tab::Measure => crate::tabs::measure_tab(ui, sim, g),
-                Tab::Auto => crate::tabs::auto_tab(ui, sim, ps),
                 Tab::Isotopes => crate::tabs::isotopes_tab(ui, sim, g, ps),
                 Tab::View => view_tab(ui, g),
                 Tab::Scenes => scenes_tab(ui, g, saved, &mut act),
@@ -332,7 +336,7 @@ fn compact(n: u64) -> String {
 
 // ---------------------------------------------------------------- tabs
 
-fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
+fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState) {
     ui.heading("Tools  [1-9]");
     let groups: [(&str, &[(Tool, &str)]); 4] = [
         ("Matter", &[(Tool::Nucleus, "Nucleus  1"), (Tool::Fill, "Fill area  4"), (Tool::Erase, "Erase  2"), (Tool::Electron, "Electron"), (Tool::Positron, "Positron"), (Tool::Spawner, "Spawner  8")]),
@@ -348,30 +352,44 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
             g.tool = tools[k].0;
         }
     }
+
+    // ---- What the tool does, and its settings ----
+    let name = TOOL_NAMES.iter().find(|t| t.0 == g.tool).map_or("Tool", |t| t.1);
+    ui.heading(name);
     ui.note(match g.tool {
-        Tool::Nucleus => "Click: place the nucleus below at rest.  Drag: launch it (energy shown).",
+        Tool::Nucleus => "Click: place the nuclide below at rest.  Drag: launch it (energy shown).",
         Tool::Electron | Tool::Positron => "Click to place, drag to launch.",
-        Tool::Erase => "Hold to erase nuclei and any reactor part (rods, channels, sources, spawners, drains, pumps).",
+        Tool::Erase => "Hold to erase nuclei and any reactor part (rods, channels, sources, spawners, drains, pumps, fields, detectors).",
         Tool::Wall => "Draw walls in the shape below.",
         Tool::EraseWall => "Hold to erase walls.",
-        Tool::Rod => "Drag down to lay a control-rod channel. Rods move together from the Reactor tab.",
+        Tool::Rod => "Drag down to lay a control-rod channel. The rods move together (Controls tab).",
         Tool::FuelChannel => "Click to load the nuclide below and register a fuel channel the fuelling machine keeps loaded.",
         Tool::Source => "Click to add an Am-Be startup neutron source (as many as you like).",
-        Tool::Fill => "Drag a rectangle to fill it with the nuclide below: moderator, fuel salt, propellant.",
-        Tool::Spawner => "Click (or drag to aim) to add a spawner for the nuclide below: a fuel line, propellant feed or neutron gun - or, in beam mode, an accelerator beam at a set energy (fusion targets, colliding beams, spallation).",
+        Tool::Fill => "Drag a rectangle to fill it with the nuclide below: moderator, fuel salt, propellant, a target.",
+        Tool::Spawner => "Click to place, or drag to aim. Choose what it fires below; once placed, every spawner can be adjusted on the Controls tab.",
         Tool::Inspect => "Click a nucleus: its properties, the reaction or decay that made it and what it becomes (Measure tab).",
         Tool::Detector => "Drag a box (counts what enters it or is made in it) or a line (counts what crosses it). Readings and spectra on the Measure tab.",
-        Tool::Field => "Drag a rectangle: a region of electric and/or magnetic field that steers charged particles (beams, plasma traps). Edit it on the Measure tab.",
-        Tool::Drain => "Drag a rectangle: matter entering it is removed and measured (exhaust nozzle, drain tank, off-gas).",
+        Tool::Field => "Drag a rectangle: a region of electric and/or magnetic field that steers charged particles (beams, plasma traps, mass separation). Adjust it later on the Controls tab.",
+        Tool::Drain => "Drag a rectangle: matter entering it is removed and measured (exhaust nozzle, beam dump, drain tank, off-gas).",
         Tool::Pump => "Drag a rectangle along the flow: it pushes matter (not neutrons) that way. Loops make a molten-salt circuit.",
         Tool::Force => "Hold the left button to pull matter towards the mouse, Shift to push it away. The right button does the same with any tool.",
     });
+    // What a placing tool places comes first.
+    if g.tool == Tool::Spawner {
+        let mut k = g.beam as usize;
+        if ui.segmented(&["Feed (drag sets speed)", "Beam (set energy)"], &mut k, 2) {
+            g.beam = k == 1;
+        }
+    }
+    if g.uses_nuclide() && g.tool != Tool::Detector {
+        nuclide_picker(ui, sim, g);
+        ui.space(4.0);
+    }
     match g.tool {
         Tool::Erase | Tool::EraseWall => {
             ui.slider("Eraser size", &mut g.brush_radius, 5.0, 150.0, Scale::Lin, 20.0, |v| format!("{v:.0} px"));
         }
         Tool::Wall => {
-            ui.note("Shape");
             let names: Vec<&str> = crate::draw::SHAPES.iter().map(|s| s.1).collect();
             let mut k = crate::draw::SHAPES.iter().position(|s| s.0 == g.wall_shape).unwrap_or(0);
             if ui.segmented(&names, &mut k, 3) {
@@ -387,6 +405,7 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
             if g.wall_shape == crate::draw::Shape::Circle {
                 ui.stepper("Sides", &mut g.circle_sides, 3, 96);
             }
+            ui.note("Material");
             let names: Vec<&str> = WallKind::ALL.iter().map(|k| k.name()).collect();
             let mut k = WallKind::ALL.iter().position(|&w| w == g.wall.kind).unwrap_or(0);
             if ui.segmented(&names, &mut k, 2) {
@@ -412,7 +431,7 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
                 }
             }
             thickness_slider(ui, g);
-            ui.note("Settings apply to the walls you draw next; walls already drawn keep theirs (hover one to see them).");
+            ui.note("These apply to the walls you draw next; walls already drawn keep theirs (hover one to see them).");
         }
         Tool::Spawner => crate::tabs::new_spawner_options(ui, sim, g),
         Tool::Detector => {
@@ -421,10 +440,10 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
                 g.det_line = k == 1;
             }
             ui.segmented(&sim_core::detector::DetectFilter::NAMES, &mut g.det_filter, 4);
-            if g.det_filter >= 5 {
-                ui.note(&format!("Uses the loader below: {}", if g.det_filter == 5 { nucdata::SYMBOLS.get(g.z as usize).copied().unwrap_or("n").to_string() } else { nuclide_name(g.z, g.n) }));
-            }
             ui.checkbox("Count photons and neutrinos too", &mut g.det_light);
+            if g.det_filter >= 5 {
+                nuclide_picker(ui, sim, g);
+            }
         }
         Tool::Field => {
             ui.slider("Magnetic: proton turn rate", &mut g.field_b, -10.0, 10.0, Scale::Lin, 2.0, |v| {
@@ -472,55 +491,52 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
         g.tool,
         Tool::Wall | Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner | Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field
     ) {
-        ui.heading("Snapping");
-        ui.checkbox("Snap points to a grid  [G]", &mut g.snap.grid_on);
-        if g.snap.grid_on {
-            ui.slider("Grid spacing", &mut g.snap.grid, 5.0, 100.0, Scale::Lin, 20.0, |v| format!("{v:.0} px"));
-        }
-        ui.slider("Angle step (hold Ctrl)", &mut g.snap.angle_step, 1.0, 90.0, Scale::Lin, 15.0, |v| format!("{v:.0}°"));
-        ui.note("Hold Ctrl while dragging: walls, launches, spawner aim and detector lines snap to the angle step; rectangles become squares.");
-    }
-
-    ui.heading("Nucleus loader");
-    let r = ui.text_field("Nuclide", &mut g.nuclide_text, "e.g. U-235, Co60, alpha");
-    if r.changed {
-        if let Some((z, n)) = parse_nuclide(&g.nuclide_text) {
-            g.z = z;
-            g.n = n;
-            if !matches!(g.tool, Tool::FuelChannel) {
-                g.tool = Tool::Nucleus;
+        let badge = format!("{}Ctrl {:.0}°", if g.snap.grid_on { format!("grid {:.0} px   ", g.snap.grid) } else { String::new() }, g.snap.angle_step);
+        let open = ps.open.entry("snapping").or_insert(false);
+        if ui.section("Snapping", &badge, open) {
+            ui.checkbox("Snap points to a grid  [G]", &mut g.snap.grid_on);
+            if g.snap.grid_on {
+                ui.slider("Grid spacing", &mut g.snap.grid, 5.0, 100.0, Scale::Lin, 20.0, |v| format!("{v:.0} px"));
             }
-        }
-    }
-    if !g.nuclide_text.trim().is_empty() && parse_nuclide(&g.nuclide_text).is_none() {
-        ui.label_col("Not recognised: try \"U-235\", \"Fe56\", \"n\", \"p\", \"alpha\"", col::BAD);
-    }
-    let (z0, n0) = (g.z, g.n);
-    ui.stepper("Protons  Z", &mut g.z, 0, 118);
-    ui.stepper("Neutrons  N", &mut g.n, 0, 180);
-    let mut zf = g.z as f32;
-    if ui.slider("Z", &mut zf, 0.0, 118.0, Scale::Lin, 92.0, |v| format!("{:.0}  {}", v.round(), nucdata::SYMBOLS.get(v.round() as usize).copied().unwrap_or(""))) {
-        g.z = zf.round() as u32;
-    }
-    let mut nf = g.n as f32;
-    if ui.slider("N", &mut nf, 0.0, 180.0, Scale::Lin, 143.0, |v| format!("{:.0}", v.round())) {
-        g.n = nf.round() as u32;
-    }
-    if (g.z, g.n) != (z0, n0) {
-        g.nuclide_text = nuclide_name(g.z, g.n);
-        if !matches!(g.tool, Tool::FuelChannel) {
-            g.tool = Tool::Nucleus;
-        }
-    }
-    let lines = describe(g.z, g.n, &sim.cfg);
-    if let Some((first, rest)) = lines.split_first() {
-        ui.space(2.0);
-        ui.label_col(first, col::ACCENT);
-        for l in rest {
-            ui.note(l);
+            ui.slider("Angle step (hold Ctrl)", &mut g.snap.angle_step, 1.0, 90.0, Scale::Lin, 15.0, |v| format!("{v:.0}°"));
+            ui.note("Hold Ctrl while dragging: walls, launches, spawner aim and detector lines snap to the angle step; rectangles become squares.");
         }
     }
     ui.space(6.0);
+    ui.note("Right mouse: pull (Shift: push), strength and range set by the Push / pull tool.   Z: zoom window.   Hover anything for details.");
+}
+
+/// Tool names for the options heading.
+const TOOL_NAMES: [(Tool, &str); 17] = [
+    (Tool::Nucleus, "Nucleus"),
+    (Tool::Electron, "Electron"),
+    (Tool::Positron, "Positron"),
+    (Tool::Erase, "Erase"),
+    (Tool::Wall, "Wall"),
+    (Tool::EraseWall, "Erase wall"),
+    (Tool::Rod, "Control rod"),
+    (Tool::FuelChannel, "Fuel channel"),
+    (Tool::Source, "Neutron source"),
+    (Tool::Fill, "Fill area"),
+    (Tool::Spawner, "Spawner / beam"),
+    (Tool::Drain, "Drain"),
+    (Tool::Pump, "Pump"),
+    (Tool::Force, "Push / pull"),
+    (Tool::Inspect, "Inspect"),
+    (Tool::Detector, "Detector"),
+    (Tool::Field, "E/B field"),
+];
+
+/// Choose the nuclide the tool places (or the detector counts). Choosing
+/// one never switches tools.
+fn nuclide_picker(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
+    ui.heading(match g.tool {
+        Tool::Spawner => "Nuclide it fires",
+        Tool::Detector => "Nuclide it counts",
+        Tool::Fill => "Nuclide to fill with",
+        Tool::FuelChannel => "Fuel nuclide",
+        _ => "Nuclide",
+    });
     let presets: [(&str, u32, u32); 24] = [
         ("n", 0, 1), ("p", 1, 0), ("D", 1, 1), ("T", 1, 2), ("He-3", 2, 1), ("He-4", 2, 2),
         ("Li-6", 3, 3), ("Li-7", 3, 4), ("Be-7", 4, 3), ("B-10", 5, 5), ("C-12", 6, 6), ("C-14", 6, 8),
@@ -531,21 +547,46 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
     let on = presets.iter().position(|p| (p.1, p.2) == (g.z, g.n));
     if let Some(k) = ui.button_grid(&names, 6, on) {
         let (_, z, n) = presets[k];
-        g.z = z;
-        g.n = n;
-        g.nuclide_text = nuclide_name(z, n);
-        if !matches!(g.tool, Tool::FuelChannel) {
-            g.tool = Tool::Nucleus;
+        g.choose_nuclide(z, n);
+    }
+    // Keep the box in step with the choice (unless it's being typed in).
+    if !ui.typing() && parse_nuclide(&g.nuclide_text) != Some((g.z, g.n)) {
+        g.nuclide_text = nuclide_name(g.z, g.n);
+    }
+    let r = ui.text_field("Any other", &mut g.nuclide_text, "type one: U-235, Co60, alpha...");
+    if r.changed {
+        if let Some((z, n)) = parse_nuclide(&g.nuclide_text) {
+            g.z = z;
+            g.n = n;
         }
     }
-    ui.space(4.0);
-    let mut matter = sim.cfg.matter;
-    if ui.checkbox("In matter (off: vacuum, bare ions repel)", &mut matter) {
-        sim.cfg = sim.cfg.clone().with_medium(matter);
+    if !g.nuclide_text.trim().is_empty() && parse_nuclide(&g.nuclide_text).is_none() {
+        ui.label_col("Not recognised: try \"U-235\", \"Fe56\", \"n\", \"p\", \"alpha\"", col::BAD);
     }
-    ui.checkbox("Add electrons with each nucleus", &mut g.with_electrons);
-    ui.space(6.0);
-    ui.note("Right mouse: pull (Shift: push), strength and range set by the Push / pull tool.   Z: zoom window.   Hover anything for details.");
+    let (z0, n0) = (g.z, g.n);
+    ui.stepper("Protons  Z", &mut g.z, 0, 118);
+    ui.stepper("Neutrons  N", &mut g.n, 0, 180);
+    if (g.z, g.n) != (z0, n0) {
+        g.nuclide_text = nuclide_name(g.z, g.n);
+    }
+    // Full facts for the Nucleus tool; name and half-life for the others.
+    let lines = describe(g.z, g.n, &sim.cfg);
+    let shown = if g.tool == Tool::Nucleus { lines.len() } else { 2 };
+    if let Some((first, rest)) = lines.split_first() {
+        ui.space(2.0);
+        ui.label_col(first, col::ACCENT);
+        for l in rest.iter().take(shown.saturating_sub(1)) {
+            ui.note(l);
+        }
+    }
+    if matches!(g.tool, Tool::Nucleus | Tool::Fill) {
+        ui.space(4.0);
+        let mut matter = sim.cfg.matter;
+        if ui.checkbox("In matter (off: vacuum, bare ions repel)", &mut matter) {
+            sim.cfg = sim.cfg.clone().with_medium(matter);
+        }
+        ui.checkbox("Add electrons with each nucleus", &mut g.with_electrons);
+    }
 }
 
 /// Thickness of the next wall (only new walls).
@@ -605,7 +646,7 @@ fn filter_options(ui: &mut Gui, g: &mut Game) {
     ui.label_col(&format!("This filter {}", describe_filter(w.rule, w.filter_z, w.threshold, w.only)), col::ACCENT);
 }
 
-fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actions, loader: (u32, u32)) {
+fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actions) {
     let re = &sim.reactor;
     let last = |f: &dyn Fn(&Sample) -> f32| -> f32 {
         let k = re.samples.len().min(8);
@@ -729,72 +770,34 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
         return;
     }
 
-    if !sim.reactor.rods.is_empty() {
-        ui.heading("Control rods  [↑ / ↓,  X = SCRAM]");
-        let re = &mut sim.reactor;
-        let mut pct = re.target * 100.0;
-        if ui.slider("Rod position (target)", &mut pct, 0.0, 100.0, Scale::Lin, 100.0, |v| format!("{v:.0}% in")) {
-            re.target = pct / 100.0;
-            re.scram = false;
+    // ---- Plant state (adjust it on the Controls tab) ----
+    let re = &sim.reactor;
+    if !re.rods.is_empty() || !re.sites.is_empty() {
+        ui.heading("Plant");
+        if !re.rods.is_empty() {
+            let moving = (re.target - re.insertion).abs() > 1e-3;
+            ui.kv(
+                "Control rods",
+                &format!("{:.0}% in{}", re.insertion * 100.0, if re.scram { "  SCRAM" } else if moving { format!("  → {:.0}%", re.target * 100.0).leak() } else { "" }),
+                if re.scram { col::BAD } else { col::TEXT },
+            );
+            ui.kv("Neutrons absorbed by rods", &re.rod_captures.to_string(), col::DIM);
         }
-        let bar = ui.alloc(22.0);
-        let fill = Rect::new(bar.x, bar.y + 4.0, bar.w, 10.0);
-        draw_rectangle(fill.x, fill.y, fill.w, fill.h, col::TRACK);
-        draw_rectangle(fill.x, fill.y, fill.w * re.insertion, fill.h, if re.scram { col::BAD } else { Color::from_rgba(120, 126, 146, 255) });
-        draw_rectangle_lines(fill.x, fill.y, fill.w, fill.h, 1.0, col::EDGE);
-        let moving = (re.target - re.insertion).abs() > 1e-3;
-        ui.note(&format!(
-            "actual {:.0}% in{}",
-            re.insertion * 100.0,
-            if re.scram { "   SCRAM: rods dropping" } else if moving { "   driving…" } else { "" }
-        ));
-        match ui.buttons(&["Withdraw 10%", "Insert 10%", "SCRAM"]) {
-            Some(0) => {
-                re.target = (re.target - 0.1).max(0.0);
-                re.scram = false;
-            }
-            Some(1) => re.target = (re.target + 0.1).min(1.0),
-            Some(2) => re.scram(),
-            _ => {}
-        }
-        let mut drive = re.drive * 100.0;
-        if ui.slider("Rod drive speed", &mut drive, 1.0, 50.0, Scale::Log, 8.0, |v| format!("{v:.0}%/s")) {
-            re.drive = drive / 100.0;
-        }
-        ui.note(&format!("{} rods   {} neutrons absorbed by them (¹⁰B + n → ⁷Li + α)", re.rods.len(), re.rod_captures));
-    }
-    if !sim.reactor.sites.is_empty() {
-        ui.heading("Fuel");
-        let re = &sim.reactor;
-        let fresh = re.sites.iter().filter(|s| s.empty_for == 0.0).count();
-        ui.kv("Fuel channels loaded", &format!("{fresh} / {}", re.sites.len()), if fresh == re.sites.len() { col::GOOD } else { col::WARN });
-        ui.kv("Channels reloaded", &re.refuels.to_string(), col::TEXT);
-        let census = &sim.nuclear.census;
-        let count = |z: u32, n: u32| census.iter().find(|c| c.0 == (z, n)).map_or(0, |c| c.1);
-        ui.kv("Xe-135 (poison)", &count(54, 81).to_string(), if count(54, 81) > 0 { col::WARN } else { col::DIM });
-        ui.kv("Pu-239 (bred)", &count(94, 145).to_string(), col::TEXT);
-        let re = &mut sim.reactor;
-        ui.checkbox("On-power refuelling (CANDU fuelling machine)", &mut re.auto_refuel);
-        ui.slider("Reload delay", &mut re.refuel_delay, 0.0, 30.0, Scale::Lin, 2.0, |v| format!("{v:.1} s"));
-        if ui.button("Reload all spent channels now") {
-            act.refuel_all = true;
+        if !re.sites.is_empty() {
+            let fresh = re.sites.iter().filter(|s| s.empty_for == 0.0).count();
+            ui.kv("Fuel channels loaded", &format!("{fresh} / {}", re.sites.len()), if fresh == re.sites.len() { col::GOOD } else { col::WARN });
+            ui.kv("Channels reloaded", &re.refuels.to_string(), col::TEXT);
+            let census = &sim.nuclear.census;
+            let count = |z: u32, n: u32| census.iter().find(|c| c.0 == (z, n)).map_or(0, |c| c.1);
+            ui.kv("Xe-135 (poison)", &count(54, 81).to_string(), if count(54, 81) > 0 { col::WARN } else { col::DIM });
+            ui.kv("Pu-239 (bred)", &count(94, 145).to_string(), col::TEXT);
         }
     }
-    let re = &mut sim.reactor;
-    if fission_plant || !re.sources.is_empty() {
-        ui.heading("Neutron sources");
-        if re.sources.is_empty() {
-            ui.note("None: place Am-Be sources with the n source tool (Build tab). A shut-down core has no neutrons of its own.");
-        } else {
-            ui.slider(&format!("Strength of each of {} sources", re.sources.len()), &mut re.source_rate, 0.0, 5.0, Scale::Lin, 0.5, |v| format!("{v:.2} n/s"));
-        }
-    }
-    crate::tabs::spawners_section(ui, sim, ps, loader);
     flow_tab(ui, sim);
     ui.heading("How to run it");
     let re = &sim.reactor;
     if !fission_plant && re.spawners.iter().any(|s| s.beam) {
-        ui.note("Beams: pick the energy per nucleon to pick the physics. Up to a few MeV/u, light nuclei tunnel and fuse (D + T, p + B-11) and the gain readout says whether you get out more than the beam put in. From ~15 MeV/u collisions start to shatter nuclei, and above ~80 MeV/u they all do: watch the Log fill with fragmentation. Detectors (Measure tab) count what comes out; the Auto tab can throttle the beams to hold a rate.");
+        ui.note("Beams: pick the energy per nucleon (Controls tab) to pick the physics. Up to a few MeV/u, light nuclei tunnel and fuse (D + T, p + B-11) and the gain readout says whether you get out more than the beam put in. From ~15 MeV/u collisions start to shatter nuclei, and above ~80 MeV/u they all do: watch the Log fill with fragmentation. Detectors (Measure tab) count what comes out; the automation on the Controls tab can throttle the beams to hold a rate. Charged products circle in your magnetic fields too: give them a drain to end in, or they'll keep crossing the beam.");
     } else if !fission_plant && fusion > 0.0 {
         ui.note("Plasma: fusion comes from the fast tail of the thermal motion tunnelling through the Coulomb barrier. Hotter plasma fuses more; D-T lights at the lowest temperature, then D-D, D-He-3, and p-B-11 needs the most. A magnetic field (Field tool, M) keeps the ions in while the fusion neutrons fly out.");
     } else if re.spawners.iter().any(|s| s.keep > 0) {
@@ -802,13 +805,13 @@ fn reactor_tab(ui: &mut Gui, sim: &mut Sim, ps: &mut PanelState, act: &mut Actio
     } else if re.drains.iter().any(|d| d.filter == sim_core::reactor::DrainFilter::All) && re.spawners.iter().any(|s| s.z + s.n <= 2) {
         ui.note("Rocket: withdraw the rods to heat the core. Fission heat warms the moderator; the moderator heats the conductor plate; the hydrogen pumped under the plate picks the heat up and leaves through the nozzle. The exhaust reading under Drains is your exhaust speed and thrust - more power, hotter plate, faster exhaust.");
     } else if fission_plant {
-        ui.note("Withdraw the rods until the period turns positive and power climbs, then insert them a little to hold it level (or let the controller on the Auto tab do it). Delayed neutrons from fission products (Br-87, I-137) are what make this possible: watch the period, not the instantaneous count. Xe-135 builds up after a run at power and soaks up neutrons. After a SCRAM the decay heat keeps coming.");
+        ui.note("Withdraw the rods until the period turns positive and power climbs, then insert them a little to hold it level (Controls tab; or let its automation do it). Delayed neutrons from fission products (Br-87, I-137) are what make this possible: watch the period, not the instantaneous count. Xe-135 builds up after a run at power and soaks up neutrons. After a SCRAM the decay heat keeps coming.");
     } else {
-        ui.note("Launch nuclei at each other, fill a box with hot plasma, or set up a beam (Spawner tool in beam mode). The Measure tab has detectors and an inspector; the Auto tab can run things for you.");
+        ui.note("Launch nuclei at each other, fill a box with hot plasma, or set up a beam (Spawner tool in beam mode). The Controls tab adjusts what you've built (and can automate it); the Measure tab has detectors and an inspector.");
     }
 }
 
-/// Spawners, drains, pumps and heat.
+/// Drains and heat (readouts).
 fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
     use sim_core::thermal::{format_kelvin, kelvin_of, region_theta};
     use sim_core::walls::WallKind;
@@ -825,12 +828,6 @@ fn flow_tab(ui: &mut Gui, sim: &mut Sim) {
                 format_energy(d.energy),
                 d.thrust
             ));
-        }
-    }
-    if !re.pumps.is_empty() {
-        ui.heading("Pumps");
-        for (k, pm) in re.pumps.iter_mut().enumerate() {
-            ui.slider(&format!("Pump {} speed##pm{k}", k + 1), &mut pm.speed, 0.0, 200.0, Scale::Lin, 40.0, |v| format!("{v:.0} px/s"));
         }
     }
     let walls = &sim.walls;

@@ -2,6 +2,7 @@
 //!
 //! Run: cargo run --release
 
+mod controls;
 mod draw;
 mod panel;
 mod tabs;
@@ -194,6 +195,23 @@ impl Game {
     fn say(&mut self, s: impl Into<String>) {
         self.message = Some((s.into(), get_time() + 5.0));
     }
+
+    /// Does the current tool place or use the chosen nuclide?
+    pub fn uses_nuclide(&self) -> bool {
+        matches!(self.tool, Tool::Nucleus | Tool::Fill | Tool::Spawner | Tool::FuelChannel)
+            || (self.tool == Tool::Detector && self.det_filter >= 5)
+    }
+
+    /// Choose nuclide (z, n). A tool that uses it keeps going (a spawner
+    /// stays a spawner); any other switches to placing nuclei.
+    pub fn choose_nuclide(&mut self, z: u32, n: u32) {
+        self.z = z;
+        self.n = n;
+        self.nuclide_text = sim_core::nucdata::nuclide_name(z, n);
+        if !self.uses_nuclide() {
+            self.tool = Tool::Nucleus;
+        }
+    }
 }
 
 fn new_sim() -> Sim {
@@ -225,9 +243,9 @@ fn part_info(sim: &Sim, p: Vec2, pick: f32) -> Option<Vec<String>> {
     use sim_core::thermal::{format_kelvin, kelvin_of};
     use sim_core::nuclear::format_energy;
     let re = &sim.reactor;
-    if let Some(sp) = re.spawners.iter().find(|s| s.pos.distance(p) < pick + 5.0) {
+    if let Some((sk, sp)) = re.spawners.iter().enumerate().find(|(_, s)| s.pos.distance(p) < pick + 5.0) {
         let mut l = vec![
-            format!("{}: {}", if sp.beam { "Beam" } else { "Spawner" }, sp.label()),
+            format!("S{}  {}: {}", sk + 1, if sp.beam { "Beam" } else { "Spawner" }, sp.label()),
             if sp.keep > 0 {
                 format!("keeps {} of them in its area ({} added)", sp.keep, sp.spawned)
             } else if sp.beam {
@@ -239,7 +257,7 @@ fn part_info(sim: &Sim, p: Vec2, pick: f32) -> Option<Vec<String>> {
         if sp.pulse_period > 0.0 {
             l.push(format!("pulsed: {:.2} s every {:.1} s", sp.pulse_len, sp.pulse_period));
         }
-        l.push("Edit it on the Reactions tab.".into());
+        l.push("Adjust it on the Controls tab.".into());
         return Some(l);
     }
     for (k, d) in re.detectors.iter().enumerate() {
@@ -260,8 +278,8 @@ fn part_info(sim: &Sim, p: Vec2, pick: f32) -> Option<Vec<String>> {
             return Some(l);
         }
     }
-    if let Some(f) = re.fields.iter().find(|f| f.rect.contains(p)) {
-        return Some(vec!["Field region".into(), f.describe(), "Edit it on the Measure tab.".into()]);
+    if let Some((fk, f)) = re.fields.iter().enumerate().find(|(_, f)| f.rect.contains(p)) {
+        return Some(vec![format!("F{}  field region", fk + 1), f.describe(), "Adjust it on the Controls tab.".into()]);
     }
     if re.sources.iter().any(|s| s.distance(p) < pick + 4.0) {
         return Some(vec!["Am-Be neutron source".into(), format!("{:.2} neutrons/s, 1-8 MeV", re.source_rate)]);
@@ -440,6 +458,12 @@ async fn main() {
     } else {
         scenes::load_preset(&mut sim, 4);
     }
+    // PARTICLE_SIM_LOAD=<saved scene name>
+    if let Ok(name) = std::env::var("PARTICLE_SIM_LOAD") {
+        if let Err(e) = scenes::load(&mut sim, &name) {
+            eprintln!("load {name}: {e}");
+        }
+    }
     // PARTICLE_SIM_BEAMS=<MeV per nucleon>: two He-4 beams head-on in an
     // empty box (vacuum).
     if let Some(e) = std::env::var("PARTICLE_SIM_BEAMS").ok().and_then(|s| s.parse::<f64>().ok()) {
@@ -463,8 +487,8 @@ async fn main() {
     if let Ok(t) = std::env::var("PARTICLE_SIM_TAB") {
         ps.tab = match t.as_str() {
             "reactor" => panel::Tab::Reactor,
+            "controls" | "auto" => panel::Tab::Controls,
             "measure" => panel::Tab::Measure,
-            "auto" => panel::Tab::Auto,
             "isotopes" => panel::Tab::Isotopes,
             "view" => panel::Tab::View,
             "scenes" => panel::Tab::Scenes,
@@ -472,6 +496,17 @@ async fn main() {
             "log" => panel::Tab::Log,
             _ => panel::Tab::Build,
         };
+    }
+    // PARTICLE_SIM_SECTIONS=auto,-spawners: open (or, with -, close) panel
+    // sections (screenshots).
+    if let Ok(list) = std::env::var("PARTICLE_SIM_SECTIONS") {
+        const KEYS: [&str; 8] = ["spawners", "fields", "rods", "fuel", "sources", "pumps", "auto", "rule_builder"];
+        for item in list.split(',') {
+            let (open, name) = match item.strip_prefix('-') { Some(n) => (false, n), None => (true, item) };
+            if let Some(k) = KEYS.iter().find(|k| **k == name) {
+                ps.open.insert(k, open);
+            }
+        }
     }
     // PARTICLE_SIM_TOOL=force|filter|pump selects a tool (filter also draws
     // two demo filter walls).

@@ -4,6 +4,7 @@
 
 mod controls;
 mod draw;
+mod select;
 mod panel;
 mod tabs;
 use sim_core::gui;
@@ -64,6 +65,7 @@ pub enum Tool {
     Inspect,
     Detector,
     Field,
+    Select,
 }
 
 const TOOL_KEYS: [(KeyCode, Tool); 9] = [
@@ -189,6 +191,8 @@ pub struct Game {
     pub wall_shape: draw::Shape,
     pub circle_sides: u32,
     pub snap: draw::Snap,
+    /// Select tool: the selection, the clipboard, what's being carried.
+    pub sel: select::SelState,
 }
 
 impl Game {
@@ -435,6 +439,7 @@ async fn main() {
         wall_shape: draw::Shape::Freehand,
         circle_sides: 32,
         snap: draw::Snap::default(),
+        sel: select::SelState::default(),
     };
     let mut saved = scenes::list_scenes();
     let mut zoom = Zoom::default();
@@ -531,6 +536,21 @@ async fn main() {
             sim.reactor.spawners.push(b);
         }
         Ok("detector") => g.tool = Tool::Detector,
+        Ok("select") => {
+            // Select the left half, turn it a quarter, and paste a mirrored
+            // copy of it to the right (screenshots).
+            g.tool = Tool::Select;
+            let r = Rect::new(panel::PANEL_W, 0.0, (sim.width - panel::PANEL_W) * 0.5, sim.height);
+            g.sel.region = Some(r);
+            select::op(&mut sim, &mut g, select::Op::Copy, Vec2::ZERO);
+            if let Some(mut c) = g.sel.clip.clone() {
+                c.flip_x();
+                let at = vec2(sim.width * 0.78, sim.height * 0.5);
+                sim_core::selection::place(&mut sim, &c, at);
+            }
+            g.sel.region = Some(r);
+            select::op(&mut sim, &mut g, select::Op::Rotate(std::f32::consts::FRAC_PI_2), Vec2::ZERO);
+        }
         Ok("wall") => {
             g.tool = Tool::Wall;
             g.wall_shape = draw::Shape::Circle;
@@ -623,7 +643,7 @@ async fn main() {
         let lmb_pressed = !blocked && is_mouse_button_pressed(MouseButton::Left);
         let lmb_down = !blocked && is_mouse_button_down(MouseButton::Left);
         // Anything the left button does to the scene can be undone.
-        if lmb_pressed && !matches!(g.tool, Tool::Force | Tool::Inspect) {
+        if lmb_pressed && !matches!(g.tool, Tool::Force | Tool::Inspect | Tool::Select) {
             snapshot(&sim, &mut g);
         }
         match g.tool {
@@ -871,6 +891,10 @@ async fn main() {
                 }
             }
             Tool::Force => {} // below
+            Tool::Select => {
+                let released = is_mouse_button_released(MouseButton::Left);
+                select::mouse(&mut sim, &mut g, mouse, lmb_pressed, released, shift);
+            }
             Tool::Inspect => {
                 if lmb_pressed {
                     let pick = 10.0 / world_scale;
@@ -887,6 +911,14 @@ async fn main() {
         }
         if !matches!(g.tool, Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner) {
             drag_start = None;
+        }
+        // Leaving the Select tool: a paste is dropped, a move put back.
+        if g.tool != Tool::Select {
+            if g.sel.floating.is_some() {
+                select::op(&mut sim, &mut g, select::Op::Cancel, mouse);
+            }
+            g.sel.region = None;
+            g.sel.start = None;
         }
         if !rect_tool(g.tool) {
             rect_start = None;
@@ -943,6 +975,9 @@ async fn main() {
         // ---- Draw ----
         renderer.draw(&sim, &g.view);
         draw::draw_grid(&g.snap, sim.width, sim.height, left);
+        if g.tool == Tool::Select {
+            select::draw(&sim, &g, mouse);
+        }
         if let Some((p, a)) = sel_pos {
             let r = if sim.point_nuclei { 9.0 } else { sim.types[ids::NEUTRON as usize].radius * (a as f32 / 0.9069).sqrt() + 6.0 };
             let pulse = 0.6 + 0.3 * (get_time() as f32 * 5.0).sin();
@@ -1096,6 +1131,8 @@ async fn main() {
             if is_key_pressed(KeyCode::Space) { g.paused = !g.paused; }
             if is_key_pressed(KeyCode::Period) { g.step_once = true; }
             let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+            let sel_used = select::keys(&mut sim, &mut g, mouse, ctrl, shift);
+            if is_key_pressed(KeyCode::S) && !ctrl { g.tool = Tool::Select; }
             if ctrl && is_key_pressed(KeyCode::Z) {
                 undo(&mut sim, &mut g, shift);
             }
@@ -1109,7 +1146,7 @@ async fn main() {
                 sim.reactor.samples.clear();
                 sim.reactor.recording.clear();
             }
-            if is_key_pressed(KeyCode::V) {
+            if is_key_pressed(KeyCode::V) && !ctrl {
                 let all = ViewMode::ALL;
                 let k = all.iter().position(|&m| m == g.view.mode).unwrap_or(0);
                 g.view.mode = all[(k + 1) % all.len()];
@@ -1145,7 +1182,7 @@ async fn main() {
             if is_key_pressed(KeyCode::Z) && !ctrl {
                 zoom.toggle();
             }
-            if is_key_pressed(KeyCode::Escape) {
+            if is_key_pressed(KeyCode::Escape) && !sel_used {
                 if poly.is_empty() { zoom.state = ZoomState::Off; } else { poly.clear(); }
             }
             // Rod bank: arrows drive the rods in 5% steps, X scrams.
@@ -1156,7 +1193,7 @@ async fn main() {
                     re.scram = false;
                 }
                 if is_key_pressed(KeyCode::Down) { re.target = (re.target + 0.05).min(1.0); }
-                if is_key_pressed(KeyCode::X) {
+                if is_key_pressed(KeyCode::X) && !ctrl {
                     re.scram();
                     g.say("SCRAM: all rods in");
                 }

@@ -342,7 +342,7 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState) {
         ("Matter", &[(Tool::Nucleus, "Nucleus  1"), (Tool::Fill, "Fill area  4"), (Tool::Erase, "Erase  2"), (Tool::Electron, "Electron"), (Tool::Positron, "Positron"), (Tool::Spawner, "Spawner  8")]),
         ("Structure", &[(Tool::Wall, "Wall  3"), (Tool::EraseWall, "Erase wall"), (Tool::Pump, "Pump"), (Tool::Drain, "Drain  9"), (Tool::Field, "E/B field  M"), (Tool::Force, "Push / pull  F")]),
         ("Fission reactor", &[(Tool::Rod, "Control rod  5"), (Tool::FuelChannel, "Fuel channel  6"), (Tool::Source, "n source  7")]),
-        ("Measure", &[(Tool::Inspect, "Inspect  I"), (Tool::Detector, "Detector  K")]),
+        ("Measure and edit", &[(Tool::Inspect, "Inspect  I"), (Tool::Detector, "Detector  K"), (Tool::Select, "Select  S")]),
     ];
     for (title, tools) in groups {
         ui.note(title);
@@ -373,6 +373,7 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState) {
         Tool::Drain => "Drag a rectangle: matter entering it is removed and measured (exhaust nozzle, beam dump, drain tank, off-gas).",
         Tool::Pump => "Drag a rectangle along the flow: it pushes matter (not neutrons) that way. Loops make a molten-salt circuit.",
         Tool::Force => "Hold the left button to pull matter towards the mouse, Shift to push it away. The right button does the same with any tool.",
+        Tool::Select => "Drag a box around something to select it; drag the selection to move it. Copy, cut, paste, turn and mirror with the buttons below or the keys.",
     });
     // What a placing tool places comes first.
     if g.tool == Tool::Spawner {
@@ -484,12 +485,13 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState) {
         Tool::Fill => {
             ui.slider("Spacing between nuclei", &mut g.fill_gap, 0.0, 40.0, Scale::Lin, 4.0, |v| format!("{v:.0} px"));
         }
+        Tool::Select => select_options(ui, sim, g),
         _ => {}
     }
 
     if matches!(
         g.tool,
-        Tool::Wall | Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner | Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field
+        Tool::Wall | Tool::Nucleus | Tool::Electron | Tool::Positron | Tool::Spawner | Tool::Fill | Tool::Drain | Tool::Pump | Tool::Rod | Tool::Detector | Tool::Field | Tool::Select
     ) {
         let badge = format!("{}Ctrl {:.0}°", if g.snap.grid_on { format!("grid {:.0} px   ", g.snap.grid) } else { String::new() }, g.snap.angle_step);
         let open = ps.open.entry("snapping").or_insert(false);
@@ -506,8 +508,66 @@ fn build_tab(ui: &mut Gui, sim: &mut Sim, g: &mut Game, ps: &mut PanelState) {
     ui.note("Right mouse: pull (Shift: push), strength and range set by the Push / pull tool.   Z: zoom window.   Hover anything for details.");
 }
 
+/// The Select tool's options and buttons.
+fn select_options(ui: &mut Gui, sim: &mut Sim, g: &mut Game) {
+    use crate::select::Op;
+    let mouse: Vec2 = mouse_position().into();
+    let run = |o: Op, sim: &mut Sim, g: &mut Game| crate::select::op(sim, g, o, mouse);
+    ui.note("Takes");
+    let k = &mut g.sel.kinds;
+    let (mut w, mut m, mut p) = (k.walls, k.matter, k.parts);
+    ui.checkbox("Walls", &mut w);
+    ui.checkbox("Matter (nuclei, particles)", &mut m);
+    ui.checkbox("Parts (spawners, fields, detectors, drains, pumps, rods, channels, sources)", &mut p);
+    *k = sim_core::selection::Kinds { walls: w, matter: m, parts: p };
+    let what = if let Some(f) = &g.sel.floating {
+        format!("{}: {}", if f.origin.is_some() { "Moving" } else { "Placing" }, f.clip.summary())
+    } else if let Some(s) = g.sel.summary(sim) {
+        format!("Selected: {s}")
+    } else {
+        "Nothing selected".into()
+    };
+    ui.label_col(&what, col::ACCENT);
+    if let Some(c) = &g.sel.clip {
+        ui.note(&format!("Clipboard: {}", c.summary()));
+    }
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let step = g.snap.angle_step.max(1.0).to_radians();
+    match ui.button_grid(&["Copy", "Cut", "Paste", "Duplicate", "Delete", "Select all"], 3, None) {
+        Some(0) => run(Op::Copy, sim, g),
+        Some(1) => run(Op::Cut, sim, g),
+        Some(2) => run(Op::Paste, sim, g),
+        Some(3) => run(Op::Duplicate, sim, g),
+        Some(4) => run(Op::Delete, sim, g),
+        Some(5) => run(Op::SelectAll, sim, g),
+        _ => {}
+    }
+    ui.note("Keys: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, Ctrl+D duplicate, Del delete, Ctrl+A select all.");
+    ui.note("Turn and mirror (the selection in place, or what you're placing)");
+    let left = format!("Turn {:.0}° left  Q", g.snap.angle_step);
+    let right = format!("Turn {:.0}° right  E", g.snap.angle_step);
+    match ui.button_grid(&["90° left  Shift+R", "90° right  R", &left, &right, "Mirror ↔  H", "Mirror ↕  Shift+H"], 2, None) {
+        Some(0) => run(Op::Rotate(quarter), sim, g),
+        Some(1) => run(Op::Rotate(-quarter), sim, g),
+        Some(2) => run(Op::Rotate(step), sim, g),
+        Some(3) => run(Op::Rotate(-step), sim, g),
+        Some(4) => run(Op::FlipX, sim, g),
+        Some(5) => run(Op::FlipY, sim, g),
+        _ => {}
+    }
+    ui.note(&format!("Grid ({:.0} px; spacing under Snapping)", g.snap.grid));
+    match ui.button_grid(&["Align to grid", "Snap every point to grid"], 2, None) {
+        Some(0) => run(Op::AlignGrid, sim, g),
+        Some(1) => run(Op::SnapPoints, sim, g),
+        _ => {}
+    }
+    ui.note("Align moves it so its corner sits on the grid, keeping its shape; with grid snap on (G), whatever you move or paste lands aligned. Snap every point puts each wall end and box corner on the grid: tidies up freehand walls.");
+    ui.note("Turns by other than 90° keep boxes (fields, drains, detector boxes, pumps) upright, and control rods always hang straight down. A mirror image of a magnetic field turns the other way, as it should. Pasted nuclei keep their velocity, turned with the rest. Esc drops a paste or puts a move back; Ctrl+Z undoes any of it.");
+}
+
 /// Tool names for the options heading.
-const TOOL_NAMES: [(Tool, &str); 17] = [
+const TOOL_NAMES: [(Tool, &str); 18] = [
+    (Tool::Select, "Select"),
     (Tool::Nucleus, "Nucleus"),
     (Tool::Electron, "Electron"),
     (Tool::Positron, "Positron"),

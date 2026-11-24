@@ -21,7 +21,10 @@ for details.
   grid and angle snapping), nuclei, fill, spawners (feeds, or beams with an energy
   per nucleon, width, energy spread, divergence and pulses), pumps, drains,
   electric/magnetic field regions, control rods, fuel channels, neutron
-  sources, the inspector and detectors. Tools that place a nuclide show the
+  sources, the inspector and detectors, and Select: box-select walls,
+  matter and parts (or any of the three), then copy, cut, paste, duplicate,
+  drag to move, turn (90° or by the angle step), mirror, align to the grid
+  or snap every point to it. Tools that place a nuclide show the
   nuclide picker right under them (picking one never switches tools).
 - **Controls** — everything you can adjust while it runs, in collapsible
   sections: every spawner and beam (nuclide or mix, rate, energy, direction,
@@ -59,3 +62,6 @@ for details.
 | V, L, O | colour, trails, overlay | P | point nuclei |
 | Z | magnifier | C | clear |
 | G | grid snap | Ctrl (hold) | snap angles / squares |
+| S | select | Ctrl+C / X / V / D | copy, cut, paste, duplicate |
+| R / Shift+R | turn 90° right / left | Q / E | turn by the angle step |
+| H / Shift+H | mirror ↔ / ↕ | Del, Esc | delete, cancel / deselect |

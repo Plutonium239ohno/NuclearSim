@@ -551,6 +551,14 @@ async fn main() {
             g.sel.region = Some(r);
             select::op(&mut sim, &mut g, select::Op::Rotate(std::f32::consts::FRAC_PI_2), Vec2::ZERO);
         }
+        Ok("paste") => {
+            // Copy the middle of the scene and carry a paste of it
+            // (screenshots: pausing, and the preview in the zoom window).
+            g.tool = Tool::Select;
+            g.sel.region = Some(Rect::new(sim.width * 0.5 - 60.0, sim.height * 0.5 - 60.0, 120.0, 120.0));
+            select::op(&mut sim, &mut g, select::Op::Copy, Vec2::ZERO);
+            select::op(&mut sim, &mut g, select::Op::Paste, Vec2::ZERO);
+        }
         Ok("wall") => {
             g.tool = Tool::Wall;
             g.wall_shape = draw::Shape::Circle;
@@ -597,6 +605,11 @@ async fn main() {
         zoom.state = ZoomState::Locked;
         zoom.center = vec2(screen_width() * 0.5, screen_height() * 0.5);
     }
+    // PARTICLE_SIM_MOUSE=x,y pins the mouse (screenshots of previews).
+    let mouse_override: Option<Vec2> = std::env::var("PARTICLE_SIM_MOUSE").ok().and_then(|s| {
+        let (x, y) = s.split_once(',')?;
+        Some(vec2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+    });
     let mut frame: u64 = 0;
 
     loop {
@@ -610,7 +623,7 @@ async fn main() {
         let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
         // Hold Ctrl: directions snap to the angle step.
         let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
-        let screen_mouse: Vec2 = mouse_position().into();
+        let screen_mouse: Vec2 = mouse_override.unwrap_or_else(|| mouse_position().into());
 
         // ---- Zoom & mouse mapping ----
         ui.begin();
@@ -923,6 +936,22 @@ async fn main() {
         if !rect_tool(g.tool) {
             rect_start = None;
         }
+        // Selecting and pasting pause the game; it runs again afterwards if
+        // it was running (unless Space was pressed meanwhile).
+        if g.tool != Tool::Select {
+            g.sel.last_tool = Some(g.tool);
+        }
+        let sel_busy = g.sel.busy(g.tool);
+        if sel_busy && !g.sel.was_busy && !g.paused {
+            g.paused = true;
+            g.sel.resume = true;
+        }
+        if !sel_busy && g.sel.was_busy {
+            if std::mem::take(&mut g.sel.resume) {
+                g.paused = false;
+            }
+        }
+        g.sel.was_busy = sel_busy;
         if g.tool != Tool::Wall || g.wall_shape != draw::Shape::Polygon {
             poly.clear();
         }
@@ -974,17 +1003,80 @@ async fn main() {
 
         // ---- Draw ----
         renderer.draw(&sim, &g.view);
-        draw::draw_grid(&g.snap, sim.width, sim.height, left);
-        if g.tool == Tool::Select {
-            select::draw(&sim, &g, mouse);
+        // Previews in world coordinates: drawn on the main view, then again
+        // inside the zoom window. `px` = world units per screen pixel there.
+        let world_marks = |px: f32, left: f32| {
+            draw::draw_grid(&g.snap, sim.width, sim.height, left, px);
+            if g.tool == Tool::Select {
+                select::draw(&sim, &g, mouse, px);
+            }
+            if let Some((p, a)) = sel_pos {
+                let r = if sim.point_nuclei { 9.0 } else { sim.types[ids::NEUTRON as usize].radius * (a as f32 / 0.9069).sqrt() + 6.0 };
+                let pulse = 0.6 + 0.3 * (get_time() as f32 * 5.0).sin();
+                draw_circle_lines(p.x, p.y, r, 1.5 * px, Color::new(0.55, 1.0, 0.6, pulse));
+                draw_circle_lines(p.x, p.y, r + 4.0 * px, 1.0 * px, Color::new(0.55, 1.0, 0.6, pulse * 0.4));
+            }
+            if g.tool == Tool::Wall {
+                let w = g.wall.half * 2.0;
+                match (g.wall_shape, wall_start) {
+                    (draw::Shape::Freehand, Some(a)) if shift => draw::preview(&[(a, g.snap.end(a, mouse, ctrl))], w, px),
+                    (draw::Shape::Line | draw::Shape::Rect | draw::Shape::Circle, Some(a)) => {
+                        let shape = g.wall_shape;
+                        let b = g.snap.end(a, mouse, ctrl && shape != draw::Shape::Rect);
+                        draw::preview(&draw::segments(shape, a, b, g.circle_sides, ctrl), w, px);
+                        if shape == draw::Shape::Circle {
+                            draw_circle(a.x, a.y, 2.0 * px, Color::new(0.6, 0.65, 0.8, 0.8));
+                        }
+                    }
+                    (draw::Shape::Polygon, _) => {
+                        if let Some(&prev) = poly.last() {
+                            let b = g.snap.end(prev, mouse, ctrl);
+                            draw::preview(&[(prev, b)], w, px);
+                            let close = poly.len() >= 2 && b.distance(poly[0]) < 10.0 / world_scale;
+                            draw_circle_lines(poly[0].x, poly[0].y, 6.0 * px, px, Color::new(0.6, 1.0, 0.7, if close { 0.9 } else { 0.4 }));
+                        }
+                        for p in &poly {
+                            draw_circle(p.x, p.y, 2.5 * px, Color::new(0.6, 0.65, 0.8, 0.9));
+                        }
+                    }
+                    _ => {}
+                }
+                if !over_ui && wall_start.is_none() && poly.is_empty() && g.wall_shape != draw::Shape::Freehand {
+                    let p = g.snap.point(mouse);
+                    draw_circle_lines(p.x, p.y, 3.0 * px, px, Color::new(0.6, 0.65, 0.8, 0.6));
+                }
+            }
+            if let Some(a) = rect_start {
+                let mouse = rect_end(&g, a, mouse, ctrl);
+                let rn = sim.types[ids::NEUTRON as usize].radius;
+                let col = Color::new(0.8, 0.82, 0.9, 0.7);
+                if g.tool == Tool::Detector && g.det_line {
+                    draw_line(a.x, a.y, mouse.x, mouse.y, 1.5 * px, Color::new(0.55, 1.0, 0.6, 0.8));
+                } else if g.tool == Tool::Rod {
+                    let (top, bottom) = (a.y.min(mouse.y), a.y.max(mouse.y));
+                    draw_rectangle_lines(a.x - 1.25 * rn, top, 2.5 * rn, bottom - top, px, col);
+                } else {
+                    let r = Rect::new(a.x.min(mouse.x), a.y.min(mouse.y), (a.x - mouse.x).abs(), (a.y - mouse.y).abs());
+                    draw_rectangle_lines(r.x, r.y, r.w, r.h, px, col);
+                    if g.tool == Tool::Pump {
+                        let d = mouse - a;
+                        let dir = if d.x.abs() >= d.y.abs() { vec2(d.x.signum(), 0.0) } else { vec2(0.0, d.y.signum()) };
+                        let c = r.center();
+                        draw_line(c.x, c.y, c.x + dir.x * 14.0 * px, c.y + dir.y * 14.0 * px, 2.0 * px, col);
+                    }
+                }
+            }
+        };
+        world_marks(1.0, left);
+        zoom.draw(&mut renderer, &sim, &g.view, left, screen_rect);
+        if let Some(cam) = zoom.camera(left, screen_rect) {
+            set_camera(&cam);
+            world_marks(1.0 / zoom.factor, 0.0);
+            set_default_camera();
         }
-        if let Some((p, a)) = sel_pos {
-            let r = if sim.point_nuclei { 9.0 } else { sim.types[ids::NEUTRON as usize].radius * (a as f32 / 0.9069).sqrt() + 6.0 };
-            let pulse = 0.6 + 0.3 * (get_time() as f32 * 5.0).sin();
-            draw_circle_lines(p.x, p.y, r, 1.5, Color::new(0.55, 1.0, 0.6, pulse));
-            draw_circle_lines(p.x, p.y, r + 4.0, 1.0, Color::new(0.55, 1.0, 0.6, pulse * 0.4));
-        }
-        // Drag-to-launch preview.
+
+        // Screen-space previews (on top of the zoom window).
+        // Drag-to-launch: the arrow starts where the nucleus will appear.
         if let Some((at, s0)) = drag_start {
             let aim = if ctrl { g.snap.angle(screen_mouse - s0) } else { screen_mouse - s0 };
             let v = launch_velocity(aim, sim.cfg.max_speed);
@@ -1007,65 +1099,29 @@ async fn main() {
             draw_text(&label, screen_mouse.x + 12.0, screen_mouse.y - 10.0, 18.0, Color::new(1.0, 0.9, 0.5, 1.0));
         }
         if g.tool == Tool::Wall {
-            let w = g.wall.half * 2.0;
             match (g.wall_shape, wall_start) {
                 (draw::Shape::Freehand, Some(a)) if shift => {
-                    let b = g.snap.end(a, mouse, ctrl);
-                    draw::preview(&[(a, b)], w);
-                    draw::label(&draw::readout(draw::Shape::Line, a, b, 0, ctrl), screen_mouse);
+                    draw::label(&draw::readout(draw::Shape::Line, a, g.snap.end(a, mouse, ctrl), 0, ctrl), screen_mouse);
                 }
                 (draw::Shape::Line | draw::Shape::Rect | draw::Shape::Circle, Some(a)) => {
                     let shape = g.wall_shape;
                     let b = g.snap.end(a, mouse, ctrl && shape != draw::Shape::Rect);
-                    draw::preview(&draw::segments(shape, a, b, g.circle_sides, ctrl), w);
-                    if shape == draw::Shape::Circle {
-                        draw_circle(a.x, a.y, 2.0, Color::new(0.6, 0.65, 0.8, 0.8));
-                    }
                     draw::label(&draw::readout(shape, a, b, g.circle_sides, ctrl), screen_mouse);
                 }
                 (draw::Shape::Polygon, _) => {
                     if let Some(&prev) = poly.last() {
                         let b = g.snap.end(prev, mouse, ctrl);
-                        draw::preview(&[(prev, b)], w);
                         let close = poly.len() >= 2 && b.distance(poly[0]) < 10.0 / world_scale;
-                        draw_circle_lines(poly[0].x, poly[0].y, 6.0, 1.0, Color::new(0.6, 1.0, 0.7, if close { 0.9 } else { 0.4 }));
                         let tip = if close { "click: close the shape".to_string() } else { draw::readout(draw::Shape::Line, prev, b, 0, ctrl) };
                         draw::label(&tip, screen_mouse);
-                    }
-                    for p in &poly {
-                        draw_circle(p.x, p.y, 2.5, Color::new(0.6, 0.65, 0.8, 0.9));
                     }
                 }
                 _ => {}
             }
-            if !over_ui && wall_start.is_none() && poly.is_empty() && g.wall_shape != draw::Shape::Freehand {
-                let p = g.snap.point(mouse);
-                draw_circle_lines(p.x, p.y, 3.0, 1.0, Color::new(0.6, 0.65, 0.8, 0.6));
-            }
         }
-        if let Some(a) = rect_start {
-            let mouse = rect_end(&g, a, mouse, ctrl);
-            let rn = sim.types[ids::NEUTRON as usize].radius;
-            let col = Color::new(0.8, 0.82, 0.9, 0.7);
-            if g.tool == Tool::Detector && g.det_line {
-                draw_line(a.x, a.y, mouse.x, mouse.y, 1.5, Color::new(0.55, 1.0, 0.6, 0.8));
-                draw::label(&draw::readout(draw::Shape::Line, a, mouse, 0, ctrl), screen_mouse);
-            } else if g.tool == Tool::Rod {
-                let (top, bottom) = (a.y.min(mouse.y), a.y.max(mouse.y));
-                draw_rectangle_lines(a.x - 1.25 * rn, top, 2.5 * rn, bottom - top, 1.0, col);
-            } else {
-                let r = Rect::new(a.x.min(mouse.x), a.y.min(mouse.y), (a.x - mouse.x).abs(), (a.y - mouse.y).abs());
-                draw_rectangle_lines(r.x, r.y, r.w, r.h, 1.0, col);
-                if g.tool == Tool::Pump {
-                    let d = mouse - a;
-                    let dir = if d.x.abs() >= d.y.abs() { vec2(d.x.signum(), 0.0) } else { vec2(0.0, d.y.signum()) };
-                    let c = r.center();
-                    draw_line(c.x, c.y, c.x + dir.x * 14.0, c.y + dir.y * 14.0, 2.0, col);
-                }
-            }
+        if let (Some(a), Tool::Detector, true) = (rect_start, g.tool, g.det_line) {
+            draw::label(&draw::readout(draw::Shape::Line, a, rect_end(&g, a, mouse, ctrl), 0, ctrl), screen_mouse);
         }
-
-        zoom.draw(&mut renderer, &sim, &g.view, left, screen_rect);
 
         // Cursor.
         if !over_ui && zoom.state != ZoomState::Aiming {
@@ -1128,7 +1184,10 @@ async fn main() {
         // like "Co-60" into a text field) ----
         if !typing {
             if is_key_pressed(KeyCode::Tab) { g.panel_open = !g.panel_open; }
-            if is_key_pressed(KeyCode::Space) { g.paused = !g.paused; }
+            if is_key_pressed(KeyCode::Space) {
+                g.paused = !g.paused;
+                g.sel.resume = false;
+            }
             if is_key_pressed(KeyCode::Period) { g.step_once = true; }
             let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
             let sel_used = select::keys(&mut sim, &mut g, mouse, ctrl, shift);

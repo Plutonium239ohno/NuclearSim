@@ -105,27 +105,27 @@ pub fn readout(shape: Shape, a: Vec2, b: Vec2, sides: u32, ctrl: bool) -> String
 }
 
 /// Faint grid over the world (main view: world = screen).
-pub fn draw_grid(snap: &Snap, w: f32, h: f32, left: f32) {
+pub fn draw_grid(snap: &Snap, w: f32, h: f32, left: f32, px: f32) {
     if !snap.grid_on || snap.grid < 4.0 {
         return;
     }
     let c = Color::new(1.0, 1.0, 1.0, 0.05);
     let mut x = (left / snap.grid).ceil() * snap.grid;
     while x < w {
-        draw_line(x, 0.0, x, h, 1.0, c);
+        draw_line(x, 0.0, x, h, px, c);
         x += snap.grid;
     }
     let mut y = 0.0;
     while y < h {
-        draw_line(left, y, w, y, 1.0, c);
+        draw_line(left, y, w, y, px, c);
         y += snap.grid;
     }
 }
 
 /// Preview of segments being drawn (thick, translucent).
-pub fn preview(segs: &[(Vec2, Vec2)], thickness: f32) {
+pub fn preview(segs: &[(Vec2, Vec2)], thickness: f32, px: f32) {
     for &(a, b) in segs {
-        draw_line(a.x, a.y, b.x, b.y, thickness.max(1.0), Color::new(0.6, 0.65, 0.8, 0.5));
+        draw_line(a.x, a.y, b.x, b.y, thickness.max(px), Color::new(0.6, 0.65, 0.8, 0.5));
     }
 }
 

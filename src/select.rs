@@ -31,9 +31,20 @@ pub struct SelState {
     /// What the selection holds, for the panel: (region, when, text),
     /// refreshed twice a second (counting a big selection isn't free).
     pub summary: Option<(Rect, f64, String)>,
+    /// The tool to go back to once a paste is placed or cancelled.
+    pub last_tool: Option<crate::Tool>,
+    /// Selecting or pasting last frame (the game pauses meanwhile).
+    pub was_busy: bool,
+    /// The game was running when selecting began: run again afterwards.
+    pub resume: bool,
 }
 
 impl SelState {
+    /// Selecting, holding a selection, or carrying a paste or a move.
+    pub fn busy(&self, tool: crate::Tool) -> bool {
+        self.floating.is_some() || (tool == crate::Tool::Select && (self.start.is_some() || self.region.is_some()))
+    }
+
     pub fn summary(&mut self, sim: &Sim) -> Option<String> {
         let r = self.region?;
         let now = get_time();
@@ -95,6 +106,13 @@ fn drop_floating(sim: &mut Sim, g: &mut Game, mouse: Vec2) {
     }
 }
 
+/// A paste is done (placed or cancelled): put the Select tool away.
+fn finish_paste(g: &mut Game) {
+    g.sel.region = None;
+    g.sel.start = None;
+    g.tool = g.sel.last_tool.unwrap_or(crate::Tool::Nucleus);
+}
+
 /// Lift the selection out of the scene (for a move or a turn in place).
 fn lift(sim: &mut Sim, g: &mut Game) -> Option<(Clip, Vec2)> {
     let r = g.sel.region?;
@@ -138,7 +156,10 @@ pub fn op(sim: &mut Sim, g: &mut Game, op: Op, mouse: Vec2) {
                         g.sel.region = Some(selection::place(sim, &clip, at));
                         g.say("Move cancelled");
                     }
-                    _ => g.say(if op == Op::Cancel { "Paste cancelled" } else { "Deleted" }),
+                    _ => {
+                        g.say(if op == Op::Cancel { "Paste cancelled" } else { "Deleted" });
+                        finish_paste(g);
+                    }
                 }
             }
             Op::Copy => g.sel.clip = Some(f.clip.clone()),
@@ -227,6 +248,7 @@ pub fn mouse(sim: &mut Sim, g: &mut Game, mouse: Vec2, pressed: bool, released: 
         let drop = if f.drag { released } else { pressed };
         if drop {
             let stamp = shift && !f.drag;
+            let paste = f.origin.is_none();
             let clip = f.clip.clone();
             let grab = f.grab;
             drop_floating(sim, g, mouse);
@@ -234,6 +256,8 @@ pub fn mouse(sim: &mut Sim, g: &mut Game, mouse: Vec2, pressed: bool, released: 
                 // Shift-click: keep stamping copies.
                 snapshot(sim, g);
                 g.sel.floating = Some(Floating { clip, grab, origin: None, drag: false });
+            } else if paste {
+                finish_paste(g);
             }
         }
         return;
@@ -299,51 +323,56 @@ pub fn keys(sim: &mut Sim, g: &mut Game, mouse: Vec2, ctrl: bool, shift: bool) -
 }
 
 /// The selection box, the box being dragged out, and what's being carried.
-pub fn draw(sim: &Sim, g: &Game, mouse: Vec2) {
+pub fn draw(sim: &Sim, g: &Game, mouse: Vec2, px: f32) {
     let accent = Color::new(0.45, 0.75, 1.0, 0.9);
     if let Some(a) = g.sel.start {
         let r = Rect::new(a.x.min(mouse.x), a.y.min(mouse.y), (a.x - mouse.x).abs(), (a.y - mouse.y).abs());
         draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.45, 0.75, 1.0, 0.06));
-        dashed_rect(r, accent);
+        dashed_rect(r, accent, px);
     }
     if let (Some(r), None) = (g.sel.region, g.sel.floating.as_ref()) {
         draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.45, 0.75, 1.0, 0.05));
-        dashed_rect(r, accent);
+        dashed_rect(r, accent, px);
         let tip = "drag to move   R turn   H mirror   Ctrl+C / X / D   Del";
-        draw_text(tip, r.x, r.y - 5.0, 14.0, Color::new(0.6, 0.8, 1.0, 0.8));
+        text(tip, r.x, r.y - 5.0 * px, px, Color::new(0.6, 0.8, 1.0, 0.8));
     }
     if let Some(f) = g.sel.floating.as_ref() {
         let at = anchor(g, f, mouse);
-        ghost(sim, &f.clip, at);
+        ghost(sim, &f.clip, at, px);
         let b = f.clip.bounds();
-        dashed_rect(Rect::new(b.x + at.x - 4.0, b.y + at.y - 4.0, b.w + 8.0, b.h + 8.0), accent);
+        dashed_rect(Rect::new(b.x + at.x - 4.0, b.y + at.y - 4.0, b.w + 8.0, b.h + 8.0), accent, px);
         let tip = if f.drag { "release to drop".to_string() } else { "click to place   Shift-click: stamp more   R / Q / E turn   H mirror   Esc".into() };
-        draw_text(&tip, b.x + at.x - 4.0, b.y + at.y - 9.0, 14.0, Color::new(0.6, 0.8, 1.0, 0.85));
+        text(&tip, b.x + at.x - 4.0, b.y + at.y - 4.0 - 5.0 * px, px, Color::new(0.6, 0.8, 1.0, 0.85));
     }
 }
 
-fn dashed_rect(r: Rect, c: Color) {
+/// 14 px text whatever the camera's magnification.
+fn text(s: &str, x: f32, y: f32, px: f32, color: Color) {
+    draw_text_ex(s, x, y, TextParams { font_size: 14, font_scale: px, color, ..Default::default() });
+}
+
+fn dashed_rect(r: Rect, c: Color, px: f32) {
     let edges = [(vec2(r.x, r.y), vec2(r.x + r.w, r.y)), (vec2(r.x + r.w, r.y), vec2(r.x + r.w, r.y + r.h)), (vec2(r.x + r.w, r.y + r.h), vec2(r.x, r.y + r.h)), (vec2(r.x, r.y + r.h), vec2(r.x, r.y))];
     for (a, b) in edges {
         let len = a.distance(b);
         let d = (b - a).normalize_or_zero();
         let mut t = 0.0;
         while t < len {
-            let e = (t + 6.0).min(len);
-            draw_line(a.x + d.x * t, a.y + d.y * t, a.x + d.x * e, a.y + d.y * e, 1.0, c);
-            t += 10.0;
+            let e = (t + 6.0 * px).min(len);
+            draw_line(a.x + d.x * t, a.y + d.y * t, a.x + d.x * e, a.y + d.y * e, px, c);
+            t += 10.0 * px;
         }
     }
 }
 
 /// A see-through preview of the clip with its centre at `at`.
-fn ghost(sim: &Sim, c: &Clip, at: Vec2) {
+fn ghost(sim: &Sim, c: &Clip, at: Vec2, px: f32) {
     let wall = Color::new(0.75, 0.8, 0.95, 0.55);
     for s in &c.walls {
         let (a, b) = (s.a + at, s.b + at);
-        draw_line(a.x, a.y, b.x, b.y, (s.half * 2.0).max(1.0), wall);
+        draw_line(a.x, a.y, b.x, b.y, (s.half * 2.0).max(px), wall);
     }
-    let rect = |r: Rect, col: Color| draw_rectangle_lines(r.x + at.x, r.y + at.y, r.w, r.h, 1.0, col);
+    let rect = |r: Rect, col: Color| draw_rectangle_lines(r.x + at.x, r.y + at.y, r.w, r.h, px, col);
     for f in &c.fields {
         rect(f.rect, Color::new(0.4, 0.9, 1.0, 0.6));
     }
@@ -353,29 +382,29 @@ fn ghost(sim: &Sim, c: &Clip, at: Vec2) {
     for p in &c.pumps {
         rect(p.rect, Color::new(0.6, 0.8, 1.0, 0.6));
         let m = p.rect.center() + at;
-        draw_line(m.x, m.y, m.x + p.dir.x * 14.0, m.y + p.dir.y * 14.0, 2.0, Color::new(0.6, 0.8, 1.0, 0.7));
+        draw_line(m.x, m.y, m.x + p.dir.x * 14.0 * px, m.y + p.dir.y * 14.0 * px, 2.0 * px, Color::new(0.6, 0.8, 1.0, 0.7));
     }
     for d in &c.detectors {
         let col = Color::new(0.55, 1.0, 0.6, 0.6);
         match d.shape {
             sim_core::detector::DetShape::Box(r) => rect(r, col),
-            sim_core::detector::DetShape::Line(a, b) => draw_line(a.x + at.x, a.y + at.y, b.x + at.x, b.y + at.y, 1.5, col),
+            sim_core::detector::DetShape::Line(a, b) => draw_line(a.x + at.x, a.y + at.y, b.x + at.x, b.y + at.y, 1.5 * px, col),
         }
     }
     for r in &c.rods {
-        draw_rectangle_lines(r.x - r.half_w + at.x, r.top + at.y, 2.0 * r.half_w, r.len, 1.0, Color::new(0.7, 0.72, 0.8, 0.6));
+        draw_rectangle_lines(r.x - r.half_w + at.x, r.top + at.y, 2.0 * r.half_w, r.len, px, Color::new(0.7, 0.72, 0.8, 0.6));
     }
     let spawn = Color::new(1.0, 0.82, 0.35, 0.8);
     for s in &c.spawners {
         let p = s.pos + at;
-        draw_circle_lines(p.x, p.y, 5.0, 1.0, spawn);
+        draw_circle_lines(p.x, p.y, 5.0 * px, px, spawn);
         if s.vel.length() > 0.5 {
-            let tip = p + s.vel.normalize() * 16.0;
-            draw_line(p.x, p.y, tip.x, tip.y, 1.5, spawn);
+            let tip = p + s.vel.normalize() * 16.0 * px;
+            draw_line(p.x, p.y, tip.x, tip.y, 1.5 * px, spawn);
         }
     }
     for p in c.sites.iter().map(|s| s.pos).chain(c.sources.iter().copied()) {
-        draw_circle_lines(p.x + at.x, p.y + at.y, 4.0, 1.0, Color::new(1.0, 0.6, 0.3, 0.7));
+        draw_circle_lines(p.x + at.x, p.y + at.y, 4.0 * px, px, Color::new(1.0, 0.6, 0.3, 0.7));
     }
     for p in &c.particles {
         let q = p.pos + at;

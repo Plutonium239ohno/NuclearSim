@@ -24,7 +24,9 @@ for details.
   sources, the inspector and detectors, and Select: box-select walls,
   matter and parts (or any of the three), then copy, cut, paste, duplicate,
   drag to move, turn (90° or by the angle step), mirror, align to the grid
-  or snap every point to it. Tools that place a nuclide show the
+  or snap every point to it. The game pauses while you select or paste
+  (and runs again afterwards if it was running); once a paste is placed,
+  the previous tool comes back. Tools that place a nuclide show the
   nuclide picker right under them (picking one never switches tools).
 - **Controls** — everything you can adjust while it runs, in collapsible
   sections: every spawner and beam (nuclide or mix, rate, energy, direction,
